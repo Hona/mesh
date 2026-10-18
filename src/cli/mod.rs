@@ -37,6 +37,7 @@ Targets    name · a,b · all · self · os:linux|macos|windows · -x/--exclude 
 
 /// Run the CLI; returns the process exit code.
 pub fn run(args: Vec<String>) -> i32 {
+    app::isolate_std_handles();
     let mut out = Out::default();
     let mut help = false;
     let mut cmd: Option<String> = None;

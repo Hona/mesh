@@ -31,6 +31,14 @@ impl From<&str> for Fail {
 
 pub(crate) type R<T> = Result<T, Fail>;
 
+/// Windows: make our stdin/stdout/stderr non-inheritable at startup. A child started with
+/// inheritance gets every inheritable handle, so otherwise a caller's pipe travels down the
+/// chain (update stage 1 → stage 2 → detached mux) and the caller never sees EOF.
+pub(crate) fn isolate_std_handles() {
+    #[cfg(windows)]
+    crate::host::win::std_handles_private();
+}
+
 pub(crate) fn set_verbose(on: bool) {
     crate::host::VERBOSE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
