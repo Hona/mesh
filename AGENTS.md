@@ -5,6 +5,7 @@
 - Respect the module boundaries in SPEC "Architecture" (§4.5): only `registry/github.rs` runs `gh`, only `network/tailscale.rs` runs `tailscale`; backends return model types.
 - NEVER write automated tests: no unit, integration, e2e, or any other tests, no test files, no test dependencies, no CI test steps. Verify manually on real devices.
 - Iteration speed first. Smallest change that works.
+- Never experiment on the user's real config files (opencode config, `AGENTS.md`, SSH files). Probe on copies or temp dirs; mesh may only touch its own managed entries/blocks.
 - Rust stable. Dependencies: `serde` + `serde_json` only. Ask before adding any crate.
 
 ## Dev environment (adais, Windows)
