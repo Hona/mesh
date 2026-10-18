@@ -405,8 +405,10 @@ mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--durable] [--json] <
   live and the exit code returned. Same kill rule: timeout, cancel or the serving process gone.
   Nobody logged on: fails with `not logged in …` (nothing ran). Linux: wrapped in
   `systemd-run --user --scope` when the user bus is up (out of the login session logind may
-  reap; linger keeps the user manager). macOS: runs as is. `opencode service start|restart`
-  is always durable.
+  reap; linger keeps the user manager; verified on the Debian VPS: the process lands in
+  `user@0.service/app.slice/run-*.scope`). macOS: runs as is. `opencode service start|restart`
+  is always durable. Also the fix for network clients that stall inside a Windows SSH session
+  (e.g. `ssh` to a third host hangs mid-handshake; durable: 0.7 s); the skill says so.
 - A target naming a device missing from the cache runs one sync first (§5.1).
 - The remote process gets `MESH_FROM=<calling device>`.
 - Nested (`mesh exec` run inside a `mesh exec` on a Windows device): no mux, one-shot SSH per

@@ -32,6 +32,7 @@ On Windows and macOS devices, tools that keep their login in the OS credential s
 Don't send work back to the device that sent it to you (`MESH_FROM` is set on remote commands).
 
 Use `--durable` (MCP `durable: true`) when what the command starts must keep running after it returns.
+On Windows devices, run network clients that misbehave inside SSH (e.g. `ssh` to another host) with `--durable` / `durable: true`.
 
 ## Recovery
 
