@@ -132,6 +132,67 @@ pub(crate) fn devices(index: &Index, warnings: &mut Vec<String>) -> Vec<Device> 
     out
 }
 
+/// The cached devices, reading the index (warnings dropped).
+pub(crate) fn all_devices() -> Vec<Device> {
+    devices(&read_index(), &mut Vec::new())
+}
+
+/// Held while a sync runs; scheduled and manual syncs never overlap.
+pub(crate) struct Lock(PathBuf);
+
+impl Drop for Lock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
+pub(crate) fn lock_sync() -> Result<Lock, String> {
+    use std::io::Write;
+    let p = paths::state_dir().join("sync.lock");
+    let _ = fs::create_dir_all(paths::state_dir());
+    for _ in 0..300 {
+        match fs::OpenOptions::new().write(true).create_new(true).open(&p) {
+            Ok(mut f) => {
+                let _ = write!(f, "{}", std::process::id());
+                return Ok(Lock(p));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let pid = fs::read_to_string(&p)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok());
+                let holder = pid.and_then(crate::host::process::pid_exe);
+                let live =
+                    holder.is_some_and(|exe| exe.to_string_lossy().to_lowercase().contains("mesh"));
+                if !live {
+                    let _ = fs::remove_file(&p); // stale: its process is gone
+                    continue;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+            Err(e) => return Err(format!("{}: {e}", p.display())),
+        }
+    }
+    Err("another mesh sync is still running".into())
+}
+
+/// Append-mode log `<state>/log/<name>.log` (rotated at 1 MB) with a header line.
+pub(crate) fn log_file(name: &str, header: &str) -> Option<fs::File> {
+    use std::io::Write;
+    let dir = paths::state_dir().join("log");
+    fs::create_dir_all(&dir).ok()?;
+    let p = dir.join(format!("{name}.log"));
+    if fs::metadata(&p).is_ok_and(|m| m.len() > 1 << 20) {
+        let _ = fs::rename(&p, dir.join(format!("{name}.log.1")));
+    }
+    let mut f = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(p)
+        .ok()?;
+    let _ = writeln!(f, "== {} {header}", timestamp());
+    Some(f)
+}
+
 pub(crate) fn mesh() -> Mesh {
     read_cached("mesh.json")
         .and_then(|s| serde_json::from_str(&s).ok())

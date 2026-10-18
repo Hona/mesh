@@ -1,13 +1,32 @@
 //! The only place that runs `gh`.
 
-use crate::host::{paths, vlog};
+use crate::host::{paths, process, vlog};
 use crate::model::{RegistryConfig, RepoFile};
 use serde::Deserialize;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const PARALLEL: usize = 8;
+
+fn base64(data: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(data.len().div_ceil(3) * 4);
+    for c in data.chunks(3) {
+        let n = (c[0] as u32) << 16
+            | (*c.get(1).unwrap_or(&0) as u32) << 8
+            | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            s.push(if i <= c.len() {
+                T[(n >> (18 - 6 * i) & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+    }
+    s
+}
 
 pub(crate) struct GitHub {
     gh: PathBuf,
@@ -61,7 +80,7 @@ impl GitHub {
 
     fn api(&self, accept: Option<&str>, endpoint: &str) -> Command {
         vlog!("gh api {endpoint}");
-        let mut c = Command::new(&self.gh);
+        let mut c = process::command(&self.gh);
         c.arg("api");
         if let Some(a) = accept {
             c.args(["-H", &format!("Accept: {a}")]);
@@ -79,6 +98,136 @@ impl GitHub {
             ));
         }
         Ok(out.stdout)
+    }
+
+    /// `gh api -X <method> <endpoint> --input -` with a JSON body.
+    fn send(
+        &self,
+        method: &str,
+        endpoint: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let endpoint = format!("repos/{}/{endpoint}", self.repo);
+        let mut c = self.api(None, &endpoint);
+        c.args(["-X", method, "--input", "-"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = c.spawn().map_err(|e| format!("gh: {e}"))?;
+        if let Some(mut w) = child.stdin.take() {
+            w.write_all(&serde_json::to_vec(body).unwrap_or_default())
+                .map_err(|e| e.to_string())?;
+        }
+        let out = child.wait_with_output().map_err(|e| e.to_string())?;
+        if !out.status.success() {
+            let msg = String::from_utf8_lossy(&out.stderr).to_string()
+                + &String::from_utf8_lossy(&out.stdout);
+            return Err(format!("gh api {endpoint}: {}", msg.trim()));
+        }
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("gh api {endpoint}: {e}"))
+    }
+
+    /// The signed-in GitHub user.
+    pub(crate) fn login(&self) -> Result<String, String> {
+        let out = self.run(self.api(None, "user"), "user")?;
+        let v: serde_json::Value = serde_json::from_slice(&out).map_err(|e| e.to_string())?;
+        v["login"]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| "gh: not logged in (run `gh auth login`)".into())
+    }
+
+    /// The repo's default branch; None if the repo doesn't exist.
+    pub(crate) fn default_branch(&self) -> Result<Option<String>, String> {
+        let endpoint = format!("repos/{}", self.repo);
+        match self.run(self.api(None, &endpoint), &endpoint) {
+            Ok(out) => {
+                let v: serde_json::Value =
+                    serde_json::from_slice(&out).map_err(|e| e.to_string())?;
+                Ok(v["default_branch"].as_str().map(String::from))
+            }
+            Err(e) if e.contains("Not Found") || e.contains("404") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub(crate) fn create(&self, public: bool) -> Result<(), String> {
+        let vis = if public { "--public" } else { "--private" };
+        let out = process::command(&self.gh)
+            .args(["repo", "create", &self.repo, vis])
+            .output()
+            .map_err(|e| format!("gh: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "gh repo create: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Head commit, None for an empty repo.
+    pub(crate) fn head_opt(&self) -> Result<Option<String>, String> {
+        match self.head() {
+            Ok(h) => Ok(Some(h)),
+            Err(e) if e.contains("empty") || e.contains("409") => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Write files (None = delete) under the mesh root in one commit on the branch.
+    pub(crate) fn commit(
+        &self,
+        files: &[(String, Option<Vec<u8>>)],
+        message: &str,
+    ) -> Result<(), String> {
+        let Some(head) = self.head_opt()? else {
+            // The git data API refuses empty repos; the first file goes through the contents API.
+            let Some((path, Some(data))) = files.first() else {
+                return Err("nothing to commit".into());
+            };
+            let body = serde_json::json!({ "message": message, "content": base64(data), "branch": self.branch });
+            self.send("PUT", &format!("contents/{}{path}", self.prefix), &body)?;
+            return if files.len() > 1 {
+                self.commit(&files[1..], message)
+            } else {
+                Ok(())
+            };
+        };
+        let endpoint = format!("repos/{}/git/commits/{head}", self.repo);
+        let base: serde_json::Value =
+            serde_json::from_slice(&self.run(self.api(None, &endpoint), &endpoint)?)
+                .map_err(|e| format!("gh api {endpoint}: {e}"))?;
+        let mut entries = Vec::new();
+        for (path, data) in files {
+            let path = format!("{}{path}", self.prefix);
+            entries.push(match data {
+                None => serde_json::json!({ "path": path, "mode": "100644", "type": "blob", "sha": null }),
+                Some(d) => match std::str::from_utf8(d) {
+                    Ok(s) => serde_json::json!({ "path": path, "mode": "100644", "type": "blob", "content": s }),
+                    Err(_) => {
+                        let blob = self.send("POST", "git/blobs", &serde_json::json!({ "content": base64(d), "encoding": "base64" }))?;
+                        serde_json::json!({ "path": path, "mode": "100644", "type": "blob", "sha": blob["sha"] })
+                    }
+                },
+            });
+        }
+        let tree = self.send(
+            "POST",
+            "git/trees",
+            &serde_json::json!({ "base_tree": base["tree"]["sha"], "tree": entries }),
+        )?;
+        let commit = self.send(
+            "POST",
+            "git/commits",
+            &serde_json::json!({ "message": message, "tree": tree["sha"], "parents": [head] }),
+        )?;
+        self.send(
+            "PATCH",
+            &format!("git/refs/heads/{}", self.branch),
+            &serde_json::json!({ "sha": commit["sha"] }),
+        )?;
+        Ok(())
     }
 
     /// Commit at the tip of the branch.

@@ -1,8 +1,14 @@
-//! This machine: paths, processes, admin check, opencode discovery.
+//! This machine: paths, processes, admin check, opencode discovery, local socket,
+//! scheduling, install.
 
+pub(crate) mod install;
+pub(crate) mod ipc;
 pub(crate) mod opencode;
 pub(crate) mod paths;
 pub(crate) mod process;
+pub(crate) mod schedule;
+#[cfg(windows)]
+pub(crate) mod win;
 
 use std::sync::atomic::AtomicBool;
 

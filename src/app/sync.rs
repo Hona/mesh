@@ -11,8 +11,23 @@ use std::path::{Path, PathBuf};
 
 type Files = BTreeMap<String, Vec<u8>>;
 
+/// Pull the registry into the cache without applying anything (`mesh up` reads it first).
+/// None if there's no mesh there yet.
+pub(crate) fn fetch(reg: &registry::Registry) -> Result<Option<Index>, String> {
+    let _lock = store::lock_sync()?;
+    let Some(commit) = reg.head_opt()? else {
+        return Ok(None);
+    };
+    match pull(reg, &commit, &store::read_index(), false) {
+        Ok(i) => Ok(Some(i)),
+        Err(e) if e.starts_with("not a mesh") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
 pub(crate) fn run(force: bool, keys_only: bool) -> R<SyncReport> {
     let mut r = SyncReport::default();
+    let _lock = store::lock_sync()?;
     if keys_only {
         let devices = store::devices(&store::read_index(), &mut r.warnings);
         keys(&devices, &mut r);

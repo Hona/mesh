@@ -1,10 +1,9 @@
 //! The only place that runs `tailscale`.
 
-use crate::host::{paths, vlog};
+use crate::host::{paths, process, vlog};
 use crate::model::Peer;
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap};
-use std::process::Command;
 
 #[derive(Deserialize)]
 struct Node {
@@ -28,9 +27,7 @@ struct Status {
     peer: Option<HashMap<String, Node>>,
 }
 
-/// Address + online state for each host found, in one `tailscale status` call.
-/// A host matches a node's MagicDNS label first, then its HostName (case-insensitive).
-pub(crate) fn peers(hosts: &[&str]) -> Result<BTreeMap<String, Peer>, String> {
+fn status() -> Result<Status, String> {
     let mut known = paths::unix_bin_dirs("tailscale");
     if cfg!(windows) {
         known = vec![paths::program_files().join(r"Tailscale\tailscale.exe")];
@@ -42,20 +39,44 @@ pub(crate) fn peers(hosts: &[&str]) -> Result<BTreeMap<String, Peer>, String> {
     }
     let bin = paths::find("tailscale", &known).ok_or("tailscale not found")?;
     vlog!("{} status --json", bin.display());
-    let out = Command::new(&bin)
+    let out = process::command(&bin)
         .args(["status", "--json"])
         .output()
         .map_err(|e| format!("tailscale: {e}"))?;
-    let s: Status = serde_json::from_slice(&out.stdout).map_err(|_| {
+    serde_json::from_slice(&out.stdout).map_err(|_| {
         format!(
             "tailscale status: {}",
             String::from_utf8_lossy(&out.stderr).trim()
         )
-    })?;
+    })
+}
+
+fn label(n: &Node) -> String {
+    n.dns_name.split('.').next().unwrap_or("").to_string()
+}
+
+/// This machine's network host name (MagicDNS label), address and online state.
+pub(crate) fn me() -> Result<(String, Peer), String> {
+    let s = status()?;
+    let running = s.backend_state == "Running";
+    let n = s.me.ok_or("tailscale: not logged in")?;
+    let address = n.ips.iter().flatten().find(|ip| ip.contains('.')).cloned();
+    Ok((
+        label(&n),
+        Peer {
+            address,
+            online: running && n.online,
+        },
+    ))
+}
+
+/// Address + online state for each host found, in one `tailscale status` call.
+/// A host matches a node's MagicDNS label first, then its HostName (case-insensitive).
+pub(crate) fn peers(hosts: &[&str]) -> Result<BTreeMap<String, Peer>, String> {
+    let s = status()?;
     let running = s.backend_state == "Running";
     let mut nodes: Vec<Node> = s.peer.unwrap_or_default().into_values().collect();
     nodes.extend(s.me);
-    let label = |n: &Node| n.dns_name.split('.').next().unwrap_or("").to_string();
     let mut found = BTreeMap::new();
     for host in hosts {
         let node = nodes

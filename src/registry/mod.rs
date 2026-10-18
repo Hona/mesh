@@ -12,3 +12,14 @@ pub(crate) fn open(cfg: &RegistryConfig) -> Result<Registry, String> {
         kind => Err(format!("unknown registry kind {kind:?} in state.json")),
     }
 }
+
+/// The signed-in registry user (default mesh repo owner).
+pub(crate) fn login() -> Result<String, String> {
+    let cfg = RegistryConfig {
+        kind: "github".into(),
+        repo: String::new(),
+        path: String::new(),
+        branch: String::new(),
+    };
+    open(&cfg)?.login()
+}

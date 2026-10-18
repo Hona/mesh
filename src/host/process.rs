@@ -1,6 +1,189 @@
+//! Processes: spawning (windowless when in the background), whole-tree kill, pid lookups.
 //! OS APIs only, no helper processes.
 
+use std::ffi::OsStr;
+use std::io;
 use std::path::PathBuf;
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static BACKGROUND: AtomicBool = AtomicBool::new(false);
+
+/// No console of our own (meshw, mux, mcp): children must not open console windows.
+pub(crate) fn set_background() {
+    BACKGROUND.store(true, Ordering::Relaxed);
+}
+
+#[cfg(windows)]
+fn base_flags() -> u32 {
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    if BACKGROUND.load(Ordering::Relaxed) {
+        CREATE_NO_WINDOW
+    } else {
+        0
+    }
+}
+
+/// `Command::new`, plus CREATE_NO_WINDOW on Windows when running in the background.
+pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
+    #[allow(unused_mut)]
+    let mut c = Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(base_flags());
+    }
+    c
+}
+
+/// Kills a spawned process and everything it started.
+pub(crate) struct Killer {
+    #[cfg(windows)]
+    job: super::win::Handle,
+    #[cfg(unix)]
+    pgid: i32,
+}
+
+// The job handle is only used through thread-safe kernel calls.
+unsafe impl Send for Killer {}
+unsafe impl Sync for Killer {}
+
+#[cfg(windows)]
+#[repr(C)]
+#[derive(Default)]
+struct ExtendedLimit {
+    per_process_user_time: i64,
+    per_job_user_time: i64,
+    limit_flags: u32,
+    min_working_set: usize,
+    max_working_set: usize,
+    active_process_limit: u32,
+    affinity: usize,
+    priority_class: u32,
+    scheduling_class: u32,
+    io: [u64; 6],
+    process_memory: usize,
+    job_memory: usize,
+    peak_process_memory: usize,
+    peak_job_memory: usize,
+}
+
+#[cfg(windows)]
+mod job {
+    use super::super::win::Handle;
+    use std::ffi::c_void;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        pub fn CreateJobObjectW(sa: *mut c_void, name: *const u16) -> Handle;
+        pub fn SetInformationJobObject(job: Handle, class: u32, info: *mut c_void, len: u32)
+        -> i32;
+        pub fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
+        pub fn TerminateJobObject(job: Handle, code: u32) -> i32;
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        pub fn NtResumeProcess(process: Handle) -> i32;
+    }
+}
+
+/// Spawn `cmd` so the whole tree can be killed: a kill-on-close job object on Windows
+/// (assigned while suspended, so no grandchild escapes), a new process group on unix.
+#[cfg(windows)]
+pub(crate) fn spawn_tree(cmd: &mut Command) -> io::Result<(Child, Killer)> {
+    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::process::CommandExt;
+    unsafe {
+        let job = job::CreateJobObjectW(std::ptr::null_mut(), std::ptr::null());
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let killer = Killer { job };
+        let mut info = ExtendedLimit {
+            limit_flags: 0x2000,
+            ..Default::default()
+        }; // KILL_ON_JOB_CLOSE
+        job::SetInformationJobObject(
+            job,
+            9,
+            (&mut info as *mut ExtendedLimit).cast(),
+            size_of::<ExtendedLimit>() as u32,
+        );
+        cmd.creation_flags(base_flags() | 0x4); // CREATE_SUSPENDED
+        let child = cmd.spawn()?;
+        let h = child.as_raw_handle();
+        job::AssignProcessToJobObject(job, h);
+        job::NtResumeProcess(h);
+        Ok((child, killer))
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn spawn_tree(cmd: &mut Command) -> io::Result<(Child, Killer)> {
+    use std::os::unix::process::CommandExt;
+    cmd.process_group(0);
+    let child = cmd.spawn()?;
+    let pgid = child.id() as i32;
+    Ok((child, Killer { pgid }))
+}
+
+impl Killer {
+    pub(crate) fn kill(&self) {
+        #[cfg(windows)]
+        unsafe {
+            job::TerminateJobObject(self.job, 1);
+        }
+        #[cfg(unix)]
+        unsafe {
+            unsafe extern "C" {
+                fn kill(pid: i32, sig: i32) -> i32;
+            }
+            kill(-self.pgid, 9);
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Killer {
+    fn drop(&mut self) {
+        super::win::close(self.job);
+    }
+}
+
+/// Start a long-lived background process detached from this console/session.
+pub(crate) fn spawn_detached(
+    exe: &std::path::Path,
+    args: &[&str],
+    log: std::fs::File,
+) -> io::Result<()> {
+    let mut c = Command::new(exe);
+    c.args(args)
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        super::win::std_handles_private();
+        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, and leave the caller's job if allowed
+        // (e.g. a tool runner that kills its job when the call ends).
+        if c.creation_flags(0x8 | 0x200 | 0x0100_0000).spawn().is_ok() {
+            return Ok(());
+        }
+        c.creation_flags(0x8 | 0x200);
+    }
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        unsafe extern "C" {
+            fn setsid() -> i32;
+        }
+        c.pre_exec(|| {
+            setsid();
+            Ok(())
+        });
+    }
+    c.spawn().map(drop)
+}
 
 /// Executable path of a live process; None if the pid is gone.
 #[cfg(windows)]

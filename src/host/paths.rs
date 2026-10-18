@@ -49,7 +49,7 @@ pub(crate) fn app_data_dir() -> PathBuf {
 
 pub(crate) fn on_path(name: &str) -> Option<PathBuf> {
     let exts: &[&str] = if cfg!(windows) {
-        &[".exe", ".cmd"]
+        &[".exe", ".cmd", ".bat", ".com"]
     } else {
         &[""]
     };
@@ -58,6 +58,37 @@ pub(crate) fn on_path(name: &str) -> Option<PathBuf> {
             .map(|e| dir.join(format!("{name}{e}")))
             .find(|p| p.is_file())
     })
+}
+
+/// The shell mesh uses for `exec -c` (SPEC §4.2), decided once by `mesh up`: Windows pwsh →
+/// powershell → cmd, first installed; unix the login shell. File checks only, no spawning.
+pub(crate) fn detect_shell() -> (String, PathBuf) {
+    let p = if cfg!(windows) {
+        let sys = env_dir("SystemRoot")
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("System32");
+        [
+            on_path("pwsh"),
+            Some(program_files().join(r"PowerShell\7\pwsh.exe")),
+            Some(sys.join(r"WindowsPowerShell\v1.0\powershell.exe")),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|p| p.is_file())
+        .unwrap_or_else(|| sys.join("cmd.exe"))
+    } else {
+        env::var_os("SHELL")
+            .map(PathBuf::from)
+            .filter(|p| p.is_file())
+            .unwrap_or_else(|| "/bin/sh".into())
+    };
+    (
+        p.file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_lowercase(),
+        p,
+    )
 }
 
 pub(crate) fn program_files() -> PathBuf {

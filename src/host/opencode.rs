@@ -4,7 +4,6 @@ use super::{paths, process, vlog};
 use crate::model::Opencode;
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 // Only these fields are read from service.json, never `password`.
 #[derive(Deserialize)]
@@ -103,7 +102,7 @@ fn version_key(p: &Path) -> Vec<u64> {
 }
 
 fn version(bin: &Path) -> Option<String> {
-    let out = Command::new(bin).arg("--version").output().ok()?;
+    let out = process::command(bin).arg("--version").output().ok()?;
     let s = String::from_utf8_lossy(&out.stdout);
     Some(
         s.split_whitespace()
@@ -114,7 +113,7 @@ fn version(bin: &Path) -> Option<String> {
 }
 
 fn busy(bin: &Path) -> Option<u64> {
-    let out = Command::new(bin)
+    let out = process::command(bin)
         .args(["api", "session.active"])
         .output()
         .ok()?;
@@ -153,6 +152,73 @@ pub(crate) fn probe() -> Option<Opencode> {
     }
 }
 
+/// The opencode binary `mesh exec <device> opencode …` runs (§6.4).
+pub(crate) fn bin() -> Option<PathBuf> {
+    find(service().as_ref()).map(|(p, _)| p)
+}
+
+/// (version, running service pid) for `mesh up`'s preflight line.
+pub(crate) fn installed() -> Option<(String, Option<u32>)> {
+    let svc = service();
+    let (bin, _) = find(svc.as_ref())?;
+    let pid = svc.as_ref().filter(|s| s.exe.is_some()).map(|s| s.pid);
+    let v = svc
+        .and_then(|s| s.exe.and(s.version))
+        .or_else(|| version(&bin));
+    Some((v.unwrap_or_else(|| "?".into()), pid))
+}
+
+/// Command of the global MCP server entry `name`, if any.
+pub(crate) fn mcp_entry(name: &str) -> Result<Option<Vec<String>>, String> {
+    let bin = bin().ok_or("opencode not found")?;
+    let out = process::command(bin)
+        .args(["debug", "config"])
+        .current_dir(paths::home())
+        .output()
+        .map_err(|e| e.to_string())?;
+    let v: serde_json::Value =
+        serde_json::from_slice(&out.stdout).map_err(|e| format!("opencode debug config: {e}"))?;
+    let global = paths::config_dir();
+    for src in v.as_array().into_iter().flatten() {
+        let in_global = src["path"]
+            .as_str()
+            .is_some_and(|p| Path::new(p).parent() == Some(global.as_path()));
+        if !in_global {
+            continue;
+        }
+        for entry in [
+            &src["info"]["mcp"]["servers"][name],
+            &src["info"]["mcp"][name],
+        ] {
+            if let Some(cmd) = entry["command"].as_array() {
+                return Ok(Some(
+                    cmd.iter()
+                        .filter_map(|c| c.as_str().map(String::from))
+                        .collect(),
+                ));
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// `opencode mcp add <name> --global -- <command…>`
+pub(crate) fn mcp_add(name: &str, command: &[&str]) -> Result<(), String> {
+    let bin = bin().ok_or("opencode not found")?;
+    let out = process::command(bin)
+        .args(["mcp", "add", name, "--global", "--"])
+        .args(command)
+        .current_dir(paths::home())
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let msg = String::from_utf8_lossy(&out.stderr).to_string()
+            + &String::from_utf8_lossy(&out.stdout);
+        return Err(msg.trim().to_string());
+    }
+    Ok(())
+}
+
 /// `opencode reload` if the service is running. Ok(false) if it isn't.
 pub(crate) fn reload() -> Result<bool, String> {
     let svc = service();
@@ -161,7 +227,7 @@ pub(crate) fn reload() -> Result<bool, String> {
     }
     let (bin, how) = find(svc.as_ref()).ok_or("opencode not found")?;
     vlog!("opencode: {} ({how})", bin.display());
-    let out = Command::new(bin)
+    let out = process::command(bin)
         .arg("reload")
         .output()
         .map_err(|e| e.to_string())?;

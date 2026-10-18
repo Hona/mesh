@@ -2,4 +2,4 @@
 
 mod tailscale;
 
-pub(crate) use tailscale::peers;
+pub(crate) use tailscale::{me, peers};

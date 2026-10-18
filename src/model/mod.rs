@@ -7,12 +7,21 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct State {
     pub registry: RegistryConfig,
     pub device: String,
+    /// The shell `exec -c` uses here, recorded by `mesh up`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<Shell>,
     #[serde(default)]
     pub synced: Option<String>,
 }
 
+#[derive(Serialize, Deserialize, Clone)]
+pub(crate) struct Shell {
+    pub name: String,
+    pub path: String,
+}
+
 /// Where the mesh lives (`state.json` `registry`).
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq)]
 pub(crate) struct RegistryConfig {
     pub kind: String,
     pub repo: String,
@@ -26,13 +35,15 @@ pub(crate) struct RegistryConfig {
 pub(crate) struct Mesh {
     #[serde(default)]
     pub pin: Option<String>,
+    #[serde(default)]
+    pub interval: Option<String>,
 }
 
-/// `devices/<name>.json` plus its `.pub` / `.host.pub`.
-#[derive(Deserialize, Default)]
+/// `devices/<name>.json` plus its `.pub` / `.host.pub`. The name comes from the file name.
+#[derive(Serialize, Deserialize, Default, Clone)]
 #[serde(default)]
 pub(crate) struct Device {
-    #[serde(skip)]
+    #[serde(skip_deserializing)]
     pub name: String,
     /// Network host name; the network backend resolves it to an address.
     pub host: String,
@@ -40,10 +51,75 @@ pub(crate) struct Device {
     pub arch: String,
     pub shell: String,
     pub user: String,
+    /// Absolute path of mesh on that device.
+    pub mesh: String,
     #[serde(skip)]
     pub key: Option<String>,
     #[serde(skip)]
     pub host_key: Option<String>,
+}
+
+/// What a remote command runs (SPEC §6.2). Unknown fields are ignored.
+#[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
+pub(crate) struct Envelope {
+    pub v: u32,
+    pub from: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub argv: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub env: std::collections::BTreeMap<String, String>,
+    pub tty: bool,
+    /// Seconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<f64>,
+    /// Mux only: which device the command is for.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device: Option<String>,
+}
+
+/// How a remote command ended (the `exit` frame).
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub(crate) struct ExitInfo {
+    pub code: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// One device's result in `mesh exec --json` / MCP `exec` (SPEC §5.5).
+#[derive(Serialize, Default)]
+pub(crate) struct ExecResult {
+    pub device: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exit: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stdout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stderr: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ExecReport {
+    pub results: Vec<ExecResult>,
+}
+
+/// One line of `mesh up` output.
+#[derive(Serialize)]
+pub(crate) struct Step {
+    /// "ok" ✓, "warn" !, "fail" ✗, "info" …
+    pub status: &'static str,
+    pub name: String,
+    pub detail: String,
 }
 
 /// A file in the mesh registry, path relative to the mesh root.
@@ -60,7 +136,7 @@ pub(crate) struct Peer {
     pub online: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub(crate) struct Opencode {
     pub version: Option<String>,
     pub busy: Option<u64>,

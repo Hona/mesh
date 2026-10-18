@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 
 const BEGIN: &str = "# >>> opencode-mesh (managed, do not edit) >>>";
 const END: &str = "# <<< opencode-mesh <<<";
@@ -92,13 +93,17 @@ fn known_hosts(devices: &[Device], addrs: &BTreeMap<String, String>) -> String {
 /// Ok(true) if the file changed; Err(reason) if it was skipped.
 pub(crate) fn authorize(devices: &[Device]) -> Result<bool, String> {
     let path = keys_file()?;
-    let keys: Vec<&str> = devices
+    let mut keys: Vec<&str> = Vec::new();
+    let lines = devices
         .iter()
         .filter_map(|d| d.key.as_deref())
         .flat_map(str::lines)
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .collect();
+        .map(str::trim);
+    for l in lines.filter(|l| !l.is_empty() && !l.starts_with('#')) {
+        if !keys.contains(&l) {
+            keys.push(l);
+        }
+    }
     let old = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -182,26 +187,42 @@ const WINDOWS_DEFAULT_CONFIG: &str = "AuthorizedKeysFile .ssh/authorized_keys\n\
     Match Group administrators\n\
     AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys\n";
 
+fn program_data() -> PathBuf {
+    paths::env_dir("ProgramData").unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"))
+}
+
+fn system32() -> PathBuf {
+    paths::env_dir("SystemRoot")
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+        .join("System32")
+}
+
+fn server_installed() -> bool {
+    if cfg!(windows) {
+        system32().join(r"OpenSSH\sshd.exe").is_file()
+    } else {
+        ["/usr/sbin/sshd", "/usr/bin/sshd", "/usr/local/sbin/sshd"]
+            .iter()
+            .any(|p| Path::new(p).is_file())
+    }
+}
+
 /// The authorized-keys file the local SSH server uses for this user.
 fn keys_file() -> Result<PathBuf, String> {
-    let home = paths::home();
-    let program_data =
-        paths::env_dir("ProgramData").unwrap_or_else(|| PathBuf::from(r"C:\ProgramData"));
-    let (installed, config) = if cfg!(windows) {
-        let sys = paths::env_dir("SystemRoot").unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-        (
-            sys.join(r"System32\OpenSSH\sshd.exe").is_file(),
-            program_data.join(r"ssh\sshd_config"),
-        )
-    } else {
-        let found = ["/usr/sbin/sshd", "/usr/bin/sshd", "/usr/local/sbin/sshd"]
-            .iter()
-            .any(|p| Path::new(p).is_file());
-        (found, PathBuf::from("/etc/ssh/sshd_config"))
-    };
-    if !installed {
+    if !server_installed() {
         return Err("no SSH server installed (mesh up sets one up)".into());
     }
+    keys_path()
+}
+
+fn keys_path() -> Result<PathBuf, String> {
+    let home = paths::home();
+    let program_data = program_data();
+    let config = if cfg!(windows) {
+        program_data.join(r"ssh\sshd_config")
+    } else {
+        PathBuf::from("/etc/ssh/sshd_config")
+    };
     let text = fs::read_to_string(&config).unwrap_or_else(|_| {
         if cfg!(windows) {
             WINDOWS_DEFAULT_CONFIG.into()
@@ -223,7 +244,11 @@ fn keys_file() -> Result<PathBuf, String> {
         .replace("%h", &home.display().to_string())
         .replace("%u", &user)
         .replace("%%", "%");
-    let p = PathBuf::from(expanded);
+    let p = PathBuf::from(if cfg!(windows) {
+        expanded.replace('/', "\\")
+    } else {
+        expanded
+    });
     Ok(if p.is_relative() { home.join(p) } else { p })
 }
 
@@ -263,4 +288,313 @@ fn configured(text: &str, admin: bool) -> Option<String> {
         }
     }
     matched.or(global)
+}
+
+// ---- client commands ----------------------------------------------------------------
+
+fn tool(name: &str) -> Result<PathBuf, String> {
+    let known = if cfg!(windows) {
+        vec![system32().join("OpenSSH").join(format!("{name}.exe"))]
+    } else {
+        paths::unix_bin_dirs(name)
+    };
+    paths::find(name, &known)
+        .ok_or_else(|| format!("{name} not found (install the OpenSSH client)"))
+}
+
+/// Preflight: the OpenSSH client tools mesh shells out to.
+pub(crate) fn tools() -> Result<(), String> {
+    ["ssh", "scp", "ssh-keygen"]
+        .iter()
+        .try_for_each(|t| tool(t).map(drop))
+}
+
+fn config_file() -> String {
+    paths::state_dir().join("ssh_config").display().to_string()
+}
+
+/// The only string that crosses the remote shell (SPEC §6.3): the absolute mesh path plus fixed
+/// arguments. Windows: unquoted when the path has no spaces, so it runs under whatever sshd's
+/// DefaultShell is (cmd, powershell, pwsh); otherwise double-quoted for cmd. Unix: single quotes.
+fn remote_command(d: &Device, args: &[&str]) -> String {
+    let mesh = if d.mesh.is_empty() {
+        "mesh"
+    } else {
+        d.mesh.as_str()
+    };
+    let quoted = if d.os != "windows" {
+        format!("'{}'", mesh.replace('\'', r"'\''"))
+    } else if mesh.contains(' ') {
+        format!("\"{mesh}\"")
+    } else {
+        mesh.to_string()
+    };
+    std::iter::once(quoted)
+        .chain(args.iter().map(|a| a.to_string()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn ssh(d: &Device, tty: bool) -> Result<Command, String> {
+    let mut c = process::command(tool("ssh")?);
+    c.arg("-F")
+        .arg(config_file())
+        .arg(if tty { "-t" } else { "-T" })
+        .arg(&d.name);
+    Ok(c)
+}
+
+/// The mux's persistent link: remote `exec self --serve`, frames on stdin/stdout.
+pub(crate) fn serve(d: &Device) -> Result<Child, String> {
+    ssh(d, false)?
+        .arg(remote_command(d, &["exec", "self", "--serve"]))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("ssh: {e}"))
+}
+
+/// One-shot handoff (SPEC §6.2): the envelope is the first stdin line. Caller sets stdio.
+pub(crate) fn oneshot(d: &Device) -> Result<Command, String> {
+    let mut c = ssh(d, false)?;
+    c.arg(remote_command(d, &["exec", "self", "--envelope"]));
+    Ok(c)
+}
+
+/// `exec -t`: the envelope travels hex-encoded as an argument; the terminal is passed through.
+pub(crate) fn interactive(d: &Device, hex: &str) -> Result<Command, String> {
+    let mut c = ssh(d, true)?;
+    c.arg(remote_command(d, &["exec", "self", "--envelope", hex]));
+    Ok(c)
+}
+
+/// `scp -F <state>/ssh_config [-r] src dst` (each side a local path or `<device>:<path>`).
+pub(crate) fn scp(recursive: bool, src: &str, dst: &str) -> Result<Command, String> {
+    let mut c = process::command(tool("scp")?);
+    c.arg("-F").arg(config_file());
+    if recursive {
+        c.arg("-r");
+    }
+    c.arg(src).arg(dst);
+    Ok(c)
+}
+
+// ---- this machine's SSH server ------------------------------------------------------
+
+/// This machine's SSH host key (`<type> <key>`): the .pub file, or, when that needs admin to
+/// read (Windows), asked of the running sshd with `ssh-keyscan` (`mesh up` only).
+pub(crate) fn host_key() -> Option<String> {
+    let file = if cfg!(windows) {
+        program_data().join(r"ssh\ssh_host_ed25519_key.pub")
+    } else {
+        PathBuf::from("/etc/ssh/ssh_host_ed25519_key.pub")
+    };
+    let two = |s: &str| {
+        let mut t = s.split_whitespace();
+        Some(format!("{} {}\n", t.next()?, t.next()?))
+    };
+    if let Some(k) = fs::read_to_string(file).ok().and_then(|s| two(&s)) {
+        return Some(k);
+    }
+    let out = process::command(tool("ssh-keyscan").ok()?)
+        .args(["-t", "ed25519", "127.0.0.1"])
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.lines()
+        .filter(|l| !l.starts_with('#'))
+        .find_map(|l| two(l.split_once(' ')?.1))
+}
+
+pub(crate) struct Server {
+    pub installed: bool,
+    pub running: bool,
+    pub keys: Result<PathBuf, String>,
+    /// The keys file needs admin to write (Windows administrators_authorized_keys).
+    pub keys_admin: bool,
+}
+
+pub(crate) fn server() -> Server {
+    #[cfg(windows)]
+    let running = crate::host::win::service_running("sshd");
+    #[cfg(unix)]
+    let running = {
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 22));
+        std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(1)).is_ok()
+    };
+    let keys = keys_path();
+    let keys_admin = keys.as_ref().is_ok_and(|p| {
+        let writable = if p.exists() {
+            fs::OpenOptions::new().append(true).open(p).is_ok()
+        } else {
+            p.starts_with(paths::home())
+        };
+        !writable
+    });
+    Server {
+        installed: server_installed(),
+        running,
+        keys,
+        keys_admin,
+    }
+}
+
+fn run(c: &mut Command) -> Result<(), String> {
+    let out = c.output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let msg =
+        String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
+    Err(msg.trim().to_string())
+}
+
+/// Elevated (Windows): install the OpenSSH Server capability if missing, set it automatic, start it.
+#[cfg(windows)]
+pub(crate) fn install_server(install: bool) -> Result<(), String> {
+    let mut script = String::from("$ErrorActionPreference='Stop';");
+    if install {
+        script += "if (-not (Get-Service sshd -ErrorAction SilentlyContinue)) { \
+            Get-WindowsCapability -Online -Name 'OpenSSH.Server*' | Add-WindowsCapability -Online | Out-Null };\
+            if (-not (Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue)) { \
+            New-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -DisplayName 'OpenSSH Server (sshd)' -Enabled True \
+            -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null };";
+    }
+    script += "Set-Service -Name sshd -StartupType Automatic; Start-Service sshd";
+    run(process::command("powershell.exe").args([
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        &script,
+    ]))
+}
+
+/// Elevated (Windows): create the admin keys file with the ACL sshd requires
+/// (Administrators + SYSTEM only, no inheritance). An existing file is left exactly as is.
+#[cfg(windows)]
+pub(crate) fn create_admin_keys_file(p: &Path) -> Result<(), String> {
+    if p.exists() {
+        return Ok(());
+    }
+    fs::write(p, "").map_err(|e| format!("{}: {e}", p.display()))?;
+    run(process::command("icacls").arg(p).args([
+        "/inheritance:r",
+        "/grant",
+        "*S-1-5-32-544:F",
+        "/grant",
+        "*S-1-5-18:F",
+    ]))
+}
+
+/// One sudo: install and start the OpenSSH server with the detected package manager.
+#[cfg(target_os = "linux")]
+pub(crate) fn install_server() -> Result<(), String> {
+    let managers = [
+        ("apt-get", "apt-get install -y openssh-server"),
+        ("dnf", "dnf install -y openssh-server"),
+        ("yum", "yum install -y openssh-server"),
+        ("pacman", "pacman -S --noconfirm openssh"),
+        ("zypper", "zypper -n install openssh"),
+    ];
+    let (_, install) = managers
+        .iter()
+        .find(|(b, _)| paths::on_path(b).is_some())
+        .ok_or("no known package manager")?;
+    let user = std::env::var("USER").unwrap_or_default();
+    let script = format!(
+        "{install} && (systemctl enable --now ssh 2>/dev/null || systemctl enable --now sshd) && loginctl enable-linger {user}"
+    );
+    let status = process::command("sudo")
+        .args(["sh", "-c", &script])
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("sudo sh -c '{script}' failed"))
+    }
+}
+
+pub(crate) fn key_path() -> PathBuf {
+    paths::state_dir().join("id_ed25519")
+}
+
+pub(crate) fn public_key() -> Option<String> {
+    let k = fs::read_to_string(paths::state_dir().join("id_ed25519.pub")).ok()?;
+    Some(k.trim().to_string() + "\n")
+}
+
+/// Create this device's mesh key if missing and lock it to the user. Ok(true) if created.
+pub(crate) fn ensure_key(name: &str, check: bool) -> Result<bool, String> {
+    let key = key_path();
+    if key.is_file() && public_key().is_some() {
+        return Ok(false);
+    }
+    if check {
+        return Ok(true);
+    }
+    fs::create_dir_all(paths::state_dir()).map_err(|e| e.to_string())?;
+    let _ = fs::remove_file(&key);
+    let comment = format!("opencode-mesh:{name}");
+    run(process::command(tool("ssh-keygen")?)
+        .args(["-q", "-t", "ed25519", "-N", "", "-C", &comment, "-f"])
+        .arg(&key))?;
+    #[cfg(windows)]
+    {
+        let sid = crate::host::win::user_sid().ok_or("can't read the user SID")?;
+        run(process::command("icacls").arg(&key).args([
+            "/inheritance:r",
+            "/grant:r",
+            &format!("*{sid}:F"),
+        ]))?;
+    }
+    Ok(true)
+}
+
+// ---- opt-in `Include` in ~/.ssh/config (SPEC §5.3 step 11) -------------------------
+
+pub(crate) enum Include {
+    Present,
+    Clash(String),
+    Absent,
+}
+
+fn user_config() -> PathBuf {
+    paths::home().join(".ssh").join("config")
+}
+
+fn include_line() -> String {
+    format!(
+        "Include {}",
+        ssh_path(&paths::state_dir().join("ssh_config"))
+    )
+}
+
+pub(crate) fn include_state(devices: &[Device]) -> Include {
+    let text = fs::read_to_string(user_config()).unwrap_or_default();
+    if text.lines().any(|l| l.trim() == include_line()) {
+        return Include::Present;
+    }
+    for line in text.lines().map(str::trim) {
+        let mut words = line.split_whitespace();
+        if !words.next().is_some_and(|w| w.eq_ignore_ascii_case("host")) {
+            continue;
+        }
+        if let Some(d) = words.find_map(|p| devices.iter().find(|d| d.name.eq_ignore_ascii_case(p)))
+        {
+            return Include::Clash(d.name.clone());
+        }
+    }
+    Include::Absent
+}
+
+/// Prepend the one `Include` line (everything else in the file is kept as is).
+pub(crate) fn add_include() -> Result<(), String> {
+    let p = user_config();
+    let old = fs::read_to_string(&p).unwrap_or_default();
+    if let Some(dir) = p.parent() {
+        fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    }
+    fs::write(&p, format!("{}\n{old}", include_line())).map_err(|e| format!("{}: {e}", p.display()))
 }

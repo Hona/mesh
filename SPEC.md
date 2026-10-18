@@ -585,7 +585,7 @@ ssh-ed25519 AAAA… opencode-mesh:air
   "devices": [
     { "name": "blade", "self": false, "os": "windows", "arch": "x64", "shell": "powershell",
       "user": "lukem", "online": true, "reachable": true, "latency_ms": 38,
-      "opencode": { "version": "2.0.32", "busy": 1 }, "mesh": "0.1.0" } ] }
+      "opencode": { "version": "2.0.32", "busy": 1, "service": true }, "mesh": "0.1.0" } ] }
 ```
 
 ### 8.2 `exec`
