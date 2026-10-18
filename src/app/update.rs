@@ -167,18 +167,21 @@ pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
         publish(&state, &target, &say)?;
         failed = fan_out(&state.device, &target, &say);
     }
-    match opencode::reconnect_mcp("mesh") {
-        Ok(0) => say("info", "mcp", "opencode service not running".into()),
-        Ok(n) => say(
-            "ok",
-            "mcp",
-            format!("\"mesh\" restarted on {target} ({n} opencode locations)"),
-        ),
-        Err(e) => say(
-            "warn",
-            "mcp",
-            format!("couldn't restart \"mesh\" ({e}): run `opencode reload`"),
-        ),
+    // Only a swapped binary needs the MCP server restarted.
+    if o.resume {
+        match opencode::reconnect_mcp("mesh") {
+            Ok(0) => say("info", "mcp", "opencode service not running".into()),
+            Ok(n) => say(
+                "ok",
+                "mcp",
+                format!("\"mesh\" restarted on {target} ({n} opencode locations)"),
+            ),
+            Err(e) => say(
+                "warn",
+                "mcp",
+                format!("couldn't restart \"mesh\" ({e}): run `opencode reload`"),
+            ),
+        }
     }
     Ok(if failed { 1 } else { 0 })
 }
