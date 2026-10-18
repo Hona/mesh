@@ -1,6 +1,6 @@
 [package]
 name = "mesh"
-version = "0.1.0-dev.7"
+version = "0.1.0-dev.8"
 edition = "2024"
 
 [dependencies]
