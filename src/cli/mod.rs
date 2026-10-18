@@ -27,7 +27,7 @@ Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version
   leave    remove this device from the mesh      mesh leave [--yes]
   update   update mesh on every device           mesh update [--version <x.y.z>] [--check]
   status   list devices                          mesh status [<target>] [--fast]
-  exec     run a command on devices              mesh exec [-t] [-w <dir>] [-e K=V]... [--timeout <s>] <target> <cmd> [args…]
+  exec     run a command on devices              mesh exec [-t] [-w <dir>] [-e K=V]... [--timeout <s>] [--durable] <target> <cmd> [args…]
                                                  mesh exec [flags] <target> -c '<string>'
   cp       copy files between devices            mesh cp [-r] <src> <dst>      (each side: path or <device>:<path>)
   mcp      stdio MCP server (started by opencode)
@@ -238,6 +238,8 @@ fn exec(args: &[String], out: &mut Out) -> Result<i32, Fail> {
         match args.get(1).map(String::as_str) {
             Some("--envelope") => return Ok(app::serve::envelope(args.get(2).map(String::as_str))),
             Some("--serve") => return Ok(app::serve::serve()),
+            #[cfg(windows)]
+            Some("--run-queued") => return Ok(app::durable::run_queued()),
             _ => {}
         }
     }
@@ -253,6 +255,7 @@ fn exec(args: &[String], out: &mut Out) -> Result<i32, Fail> {
         };
         match a.as_str() {
             "-t" => tty = true,
+            "--durable" => env.durable = true,
             "-w" => env.cwd = Some(value()?),
             "-e" => {
                 let kv = value()?;
@@ -304,6 +307,9 @@ fn exec(args: &[String], out: &mut Out) -> Result<i32, Fail> {
         return Err(Fail(1, format!("no devices match {target}")));
     }
     if tty {
+        if env.durable {
+            return Err(usage("exec", "--durable can't take a terminal (-t)"));
+        }
         let [d] = devices.as_slice() else {
             return Err(usage("exec", "-t needs exactly one device"));
         };

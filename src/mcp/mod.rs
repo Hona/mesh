@@ -97,7 +97,8 @@ fn tools() -> Value {
                     "cwd": { "type": "string" },
                     "env": { "type": "object", "additionalProperties": { "type": "string" } },
                     "timeout": { "type": "number", "default": 120, "description": "seconds; kills the whole process tree" },
-                    "max_bytes": { "type": "number", "default": 50000, "description": "per stream; keeps head + tail" }
+                    "max_bytes": { "type": "number", "default": 50000, "description": "per stream; keeps head + tail" },
+                    "durable": { "type": "boolean", "default": false, "description": "run outside the SSH session so what it starts keeps running (servers, Start-Process); automatic for opencode service start|restart" }
                 }
             }
         }
@@ -153,6 +154,7 @@ fn exec_tool(a: &Value) -> Result<(String, Value), String> {
             })
             .unwrap_or_default(),
         timeout: Some(a["timeout"].as_f64().unwrap_or(120.0)),
+        durable: a["durable"].as_bool().unwrap_or(false),
         ..Default::default()
     };
     let input = a["stdin"]

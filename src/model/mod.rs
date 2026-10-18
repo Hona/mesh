@@ -74,6 +74,9 @@ pub(crate) struct Envelope {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
     pub tty: bool,
+    /// Run outside the SSH session so what it starts outlives it (SPEC §5.5).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub durable: bool,
     /// Seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<f64>,

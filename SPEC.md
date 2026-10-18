@@ -29,6 +29,8 @@ When a design change is agreed, update this file in the same change.
 6. **Opt-in targeting.** Commands reach only devices the user names (§5.1).
 7. **Raw, unopinionated tools.** Two MCP tools (`status`, `exec`). No task-specific tools.
    Everything else is composed from `mesh exec <device> opencode …` or plain commands.
+8. **Remote exec depends only on the OS SSH server and the mesh binary, never on opencode**
+   (service, MCP or desktop app), so a broken opencode can always be repaired remotely.
 8. **No master.** Every device is equal. Any device can join, leave, go offline, or come back
    at any time.
 9. **Tiny.** Rust stable. Dependencies: `serde` + `serde_json` only (ask before adding any
@@ -148,6 +150,7 @@ state.json        # { "registry": { "kind": "github", "repo", "path", "branch" }
                   #   "synced": "<commit sha>" }
 sync.lock         # held during a sync (pid inside; taken over if that process is gone)
 sync.result       # how the last sync ended (report or error), for a remote `mesh sync` (§5.6)
+run/              # Windows: durable commands queued for the run task, their logs (§5.5)
 mux-<build>.sock  # Linux/macOS: the mux's local socket, one per build (dir is 0700)
 id_ed25519(.pub)  # this device's mesh key (permissions locked to the user)
 ssh_config        # generated; used via `ssh -F` for every mesh connection
@@ -350,8 +353,8 @@ running service is a different version it is appended, `2.0.28 (service 0.0.0-be
 Run a command on devices.
 
 ```
-mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--json] <target> <cmd> [args…]
-mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--json] <target> -c '<string>'
+mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--durable] [--json] <target> <cmd> [args…]
+mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--durable] [--json] <target> -c '<string>'
 ```
 
 | Rule | Precedent |
@@ -373,10 +376,20 @@ mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--json] <target> -c '
 - The tree is killed **only** on timeout, cancel (Ctrl-C, MCP cancel) or the client going away
   mid-command. A command that exits by itself leaves what it started running (Windows: the job
   stops being kill-on-close; it allows breakaway).
+- `--durable` (MCP `durable: true`): what the command starts must also outlive the SSH
+  session (mux idle exit, network drop). Windows sshd kills its session job, and a breakaway
+  lands in an outer job it kills too, so the command is queued in `<state>/run/` and run by the
+  user-context `\opencode-mesh\run` task (no trigger, parallel instances, created on first use),
+  in the logged-on user's session; its output (stdout and stderr merged, no stdin) is relayed
+  live and the exit code returned. Same kill rule: timeout, cancel or the serving process gone.
+  Nobody logged on: fails with `not logged in …` (nothing ran). Linux: wrapped in
+  `systemd-run --user --scope` when the user bus is up (out of the login session logind may
+  reap; linger keeps the user manager). macOS: runs as is. `opencode service start|restart`
+  is always durable.
 - A target naming a device missing from the cache runs one sync first (§5.1).
 - The remote process gets `MESH_FROM=<calling device>`.
-- For long-lived background commands, use opencode's own shells:
-  `mesh exec blade opencode api shell.create …` / `shell.output`.
+- For long-lived background commands: `--durable` with the command's own way to background
+  (`Start-Process`, `nohup … &`), or opencode's shells (`opencode api shell.create …`).
 
 ```sh
 mesh exec blade opencode run "fix the failing test"
@@ -642,6 +655,10 @@ Runs `mesh sync` every `interval`, as the user, no admin:
 `meshw.exe` is the windowless (`windows_subsystem = "windows"`) build of the same code — the
 `pythonw.exe` / `javaw.exe` convention. Background runs log to `<state>/log/`.
 
+Windows also has `\opencode-mesh\run` (same principal, no trigger, parallel instances, no time
+limit, action `meshw.exe exec self --run-queued`) for durable commands (§5.5); created on first
+use, removed by `leave`.
+
 ### 7.3 Authorized keys
 
 - Write a marked block into the file the SSH server actually uses for this user (admin
@@ -719,7 +736,8 @@ ssh-ed25519 AAAA… opencode-mesh:air
   "cwd":       { "type": "string" },
   "env":       { "type": "object", "additionalProperties": { "type": "string" } },
   "timeout":   { "type": "number", "default": 120 },                 // seconds
-  "max_bytes": { "type": "number", "default": 50000 } }              // per stream, keeps head + tail
+  "max_bytes": { "type": "number", "default": 50000 },               // per stream, keeps head + tail
+  "durable":   { "type": "boolean", "default": false } }             // §5.5
 // output: §5.5 JSON result
 ```
 

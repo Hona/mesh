@@ -8,6 +8,11 @@ use std::path::Path;
 pub(crate) const SYNC_TASK: &str = r"\opencode-mesh\sync";
 #[cfg(windows)]
 pub(crate) const KEYS_TASK: &str = r"\opencode-mesh\keys";
+/// On demand, no trigger: runs queued durable commands in the user's own logon (SPEC §5.5).
+#[cfg(windows)]
+pub(crate) const RUN_TASK: &str = r"\opencode-mesh\run";
+#[cfg(windows)]
+const RUN_ARGS: &str = "exec self --run-queued";
 
 #[derive(PartialEq)]
 pub(crate) enum Outcome {
@@ -48,10 +53,30 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// `every_secs` None: no trigger (started with `schtasks /run`), parallel instances, no time limit.
 #[cfg(windows)]
-fn task_xml(exe: &Path, args: &str, every_secs: u64, elevated: bool) -> Result<String, String> {
+fn task_xml(
+    exe: &Path,
+    args: &str,
+    every_secs: Option<u64>,
+    elevated: bool,
+) -> Result<String, String> {
     let sid = super::win::user_sid().ok_or("can't read the user SID")?;
-    let minutes = (every_secs / 60).max(1);
+    let (triggers, instances, limit) = match every_secs {
+        Some(s) => (
+            format!(
+                "<TimeTrigger>
+      <Repetition><Interval>PT{}M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
+      <StartBoundary>2020-01-01T00:00:00</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>",
+                (s / 60).max(1)
+            ),
+            "IgnoreNew",
+            "PT10M",
+        ),
+        None => (String::new(), "Parallel", "PT0S"),
+    };
     let (logon, level, sd) = if elevated {
         // S4U: runs whether or not the user is logged on; the user may read and run it.
         (
@@ -69,21 +94,17 @@ fn task_xml(exe: &Path, args: &str, every_secs: u64, elevated: bool) -> Result<S
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo><Description>opencode mesh</Description>{sd}</RegistrationInfo>
   <Triggers>
-    <TimeTrigger>
-      <Repetition><Interval>PT{minutes}M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
-      <StartBoundary>2020-01-01T00:00:00</StartBoundary>
-      <Enabled>true</Enabled>
-    </TimeTrigger>
+    {triggers}
   </Triggers>
   <Principals>
     <Principal id="Author"><UserId>{sid}</UserId><LogonType>{logon}</LogonType><RunLevel>{level}</RunLevel></Principal>
   </Principals>
   <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <MultipleInstancesPolicy>{instances}</MultipleInstancesPolicy>
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <StartWhenAvailable>true</StartWhenAvailable>
-    <ExecutionTimeLimit>PT10M</ExecutionTimeLimit>
+    <ExecutionTimeLimit>{limit}</ExecutionTimeLimit>
     <Enabled>true</Enabled>
   </Settings>
   <Actions Context="Author">
@@ -124,15 +145,38 @@ pub(crate) fn ensure_task(
     if check {
         return Ok(Outcome::Installed);
     }
-    let xml = task_xml(exe, args, every_secs, elevated)?;
-    let file = paths::state_dir().join("task.xml");
+    create(name, &task_xml(exe, args, Some(every_secs), elevated)?).map(|_| Outcome::Installed)
+}
+
+#[cfg(windows)]
+fn create(name: &str, xml: &str) -> Result<(), String> {
+    let file = paths::state_dir().join(format!("task-{}.xml", std::process::id()));
     let mut bytes = vec![0xFF, 0xFE];
     bytes.extend(xml.encode_utf16().flat_map(u16::to_le_bytes));
     std::fs::write(&file, bytes).map_err(|e| e.to_string())?;
     let f = file.display().to_string();
     let r = run(command("schtasks").args(["/create", "/tn", name, "/xml", &f, "/f"]));
     let _ = std::fs::remove_file(&file);
-    r.map(|_| Outcome::Installed)
+    r.map(drop)
+}
+
+/// Start the run task (creating or fixing it first if it doesn't run `meshw`).
+#[cfg(windows)]
+pub(crate) fn start_run_task(meshw: &Path) -> Result<(), String> {
+    if !task_matches_cmd(RUN_TASK, meshw, RUN_ARGS) {
+        create(RUN_TASK, &task_xml(meshw, RUN_ARGS, None, false)?)?;
+    }
+    run_task(RUN_TASK)
+}
+
+#[cfg(windows)]
+fn task_matches_cmd(name: &str, exe: &Path, args: &str) -> bool {
+    run(command("schtasks").args(["/query", "/tn", name, "/xml"])).is_ok_and(|xml| {
+        xml.contains(&format!(
+            "<Command>{}</Command>",
+            xml_escape(&exe.display().to_string())
+        )) && xml.contains(&format!("<Arguments>{args}</Arguments>"))
+    })
 }
 
 /// Start this user's sync job now, without waiting (it runs in the user's own logon, where the
@@ -182,6 +226,7 @@ pub(crate) fn remove_keys_task() -> Result<bool, String> {
 /// Undo `ensure_sync` (mesh leave). Ok(false) if there was nothing to remove.
 #[cfg(windows)]
 pub(crate) fn remove_sync() -> Result<bool, String> {
+    let _ = remove_task(RUN_TASK);
     remove_task(SYNC_TASK)
 }
 

@@ -2,7 +2,7 @@
 //! `mesh exec self --serve` (persistent link, SPEC §6.5).
 
 use super::{VERSION, store};
-use crate::host::process::{self, Killer};
+use crate::host::process;
 use crate::host::{opencode, paths};
 use crate::model::{Envelope, ExitInfo};
 use crate::transport::frame::{self, CANCEL, EXIT, HELLO, PING, START, STDERR, STDIN, STDOUT};
@@ -81,7 +81,7 @@ fn shell(s: &str) -> Result<Command, String> {
     Ok(c)
 }
 
-fn build(env: &Envelope) -> Result<Command, String> {
+pub(crate) fn build(env: &Envelope) -> Result<Command, String> {
     let mut c = match (&env.argv, &env.command) {
         (Some(argv), _) => {
             let (prog, args) = argv.split_first().ok_or("empty argv")?;
@@ -100,6 +100,12 @@ fn build(env: &Envelope) -> Result<Command, String> {
         c.current_dir(dir);
     }
     c.envs(&env.env).env("MESH_FROM", &env.from);
+    #[cfg(target_os = "linux")]
+    let c = if super::durable::wanted(env) {
+        super::durable::scope(c)
+    } else {
+        c
+    };
     Ok(c)
 }
 
@@ -110,7 +116,7 @@ fn what(env: &Envelope) -> String {
         .unwrap_or_else(|| "shell".into())
 }
 
-fn code(st: io::Result<ExitStatus>) -> i32 {
+pub(crate) fn code(st: io::Result<ExitStatus>) -> i32 {
     let Ok(st) = st else { return 255 };
     #[cfg(unix)]
     {
@@ -154,6 +160,21 @@ pub(crate) fn envelope(arg: Option<&str>) -> i32 {
             .map_err(|e| e.to_string())
             .and_then(|b| parse(&b)),
     };
+    #[cfg(windows)]
+    if let Ok(e) = &env
+        && super::durable::wanted(e)
+        && super::durable::in_ssh()
+    {
+        let info = super::durable::run(&super::durable::new_id(), e, &|b| {
+            let mut o = io::stdout();
+            let _ = o.write_all(b);
+            let _ = o.flush();
+        });
+        if let Some(err) = &info.error {
+            eprintln!("mesh: {err}");
+        }
+        return info.code.unwrap_or(255);
+    }
     let (mut child, killer) = match env.as_ref().map_err(String::clone).and_then(|e| {
         let mut c = build(e)?;
         process::spawn_tree(&mut c).map_err(|err| format!("{}: {err}", what(e)))
@@ -204,7 +225,8 @@ fn exit_frame(code: i32, error: Option<String>) -> Vec<u8> {
 
 struct Running {
     stdin: Option<mpsc::Sender<Vec<u8>>>,
-    killer: Arc<Killer>,
+    /// Cancel / lost link: kill the tree (or ask the run task to, for a durable command).
+    stop: Arc<dyn Fn() + Send + Sync>,
 }
 
 type Table = Arc<Mutex<HashMap<u32, Running>>>;
@@ -239,7 +261,7 @@ pub(crate) fn serve() -> i32 {
             }
             CANCEL => {
                 if let Some(r) = lock(&table).get(&f.id) {
-                    r.killer.kill();
+                    (r.stop)();
                 }
             }
             PING => send(&out, PING, f.id, &[]),
@@ -248,13 +270,43 @@ pub(crate) fn serve() -> i32 {
     }
     // The link is gone: nothing keeps running without it.
     for r in lock(&table).values() {
-        r.killer.kill();
+        (r.stop)();
     }
     0
 }
 
+/// A durable command (Windows, in an SSH session): run by the user-context run task.
+#[cfg(windows)]
+fn start_durable(id: u32, env: Envelope, out: &Out, table: &Table) {
+    let job = super::durable::new_id();
+    let j = job.clone();
+    lock(table).insert(
+        id,
+        Running {
+            stdin: None,
+            stop: Arc::new(move || super::durable::cancel(&j)),
+        },
+    );
+    let (out, table) = (out.clone(), table.clone());
+    std::thread::spawn(move || {
+        let info = super::durable::run(&job, &env, &|b| send(&out, STDOUT, id, b));
+        lock(&table).remove(&id);
+        send(
+            &out,
+            EXIT,
+            id,
+            &serde_json::to_vec(&info).unwrap_or_default(),
+        );
+    });
+}
+
 fn start(id: u32, data: &[u8], out: &Out, table: &Table) -> Result<(), (i32, String)> {
     let env = parse(data).map_err(|e| (255, e))?;
+    #[cfg(windows)]
+    if super::durable::wanted(&env) && super::durable::in_ssh() {
+        start_durable(id, env, out, table);
+        return Ok(());
+    }
     let mut cmd = build(&env).map_err(|e| (127, e))?;
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -300,11 +352,12 @@ fn start(id: u32, data: &[u8], out: &Out, table: &Table) -> Result<(), (i32, Str
             }
         }));
     }
+    let k = killer.clone();
     lock(table).insert(
         id,
         Running {
             stdin: Some(tx),
-            killer: killer.clone(),
+            stop: Arc::new(move || k.kill()),
         },
     );
     let timed_out = Arc::new(AtomicBool::new(false));
