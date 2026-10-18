@@ -60,36 +60,23 @@ pub(crate) fn on_path(name: &str) -> Option<PathBuf> {
     })
 }
 
-/// A tool on PATH, else in its known install locations (desktop shells often have a stale PATH).
-pub(crate) fn find(name: &str) -> Option<PathBuf> {
-    if let Some(p) = on_path(name) {
-        return Some(p);
-    }
-    let mut known: Vec<PathBuf> = Vec::new();
-    if cfg!(windows) {
-        let pf = env_dir("ProgramFiles").unwrap_or_else(|| PathBuf::from(r"C:\Program Files"));
-        let sys = env_dir("SystemRoot").unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-        match name {
-            "gh" => {
-                known.push(pf.join("GitHub CLI").join("gh.exe"));
-                known
-                    .extend(env_dir("LOCALAPPDATA").map(|l| l.join(r"Programs\GitHub CLI\gh.exe")));
-            }
-            "tailscale" => known.push(pf.join("Tailscale").join("tailscale.exe")),
-            _ => known.push(sys.join(r"System32\OpenSSH").join(format!("{name}.exe"))),
-        }
-    } else {
-        if cfg!(target_os = "macos") && name == "tailscale" {
-            known.push("/Applications/Tailscale.app/Contents/MacOS/Tailscale".into());
-        }
-        for dir in [
-            "/opt/homebrew/bin",
-            "/usr/local/bin",
-            "/usr/bin",
-            "/home/linuxbrew/.linuxbrew/bin",
-        ] {
-            known.push(PathBuf::from(dir).join(name));
-        }
-    }
-    known.into_iter().find(|p| p.is_file())
+pub(crate) fn program_files() -> PathBuf {
+    env_dir("ProgramFiles").unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
+}
+
+/// Usual macOS/Linux bin dirs that a desktop-app shell's PATH may lack.
+pub(crate) fn unix_bin_dirs(name: &str) -> Vec<PathBuf> {
+    let dirs = [
+        "/opt/homebrew/bin",
+        "/usr/local/bin",
+        "/usr/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+    ];
+    dirs.iter().map(|d| PathBuf::from(d).join(name)).collect()
+}
+
+/// A tool on PATH, else the first existing `known` install location
+/// (desktop shells often have a stale PATH).
+pub(crate) fn find(name: &str, known: &[PathBuf]) -> Option<PathBuf> {
+    on_path(name).or_else(|| known.iter().find(|p| p.is_file()).cloned())
 }

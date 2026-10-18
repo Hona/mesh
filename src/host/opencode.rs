@@ -86,9 +86,7 @@ fn known() -> Vec<PathBuf> {
             v.push(PathBuf::from("/Applications/OpenCode.app/Contents/MacOS").join(cli));
         }
         v.push(home.join(".opencode/bin/opencode"));
-        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
-            v.push(PathBuf::from(dir).join("opencode"));
-        }
+        v.extend(paths::unix_bin_dirs("opencode"));
     }
     v
 }

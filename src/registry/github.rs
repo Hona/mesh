@@ -35,7 +35,14 @@ struct TreeEntry {
 
 impl GitHub {
     pub(crate) fn open(cfg: &RegistryConfig) -> Result<GitHub, String> {
-        let gh = paths::find("gh")
+        let known = if cfg!(windows) {
+            let mut k = vec![paths::program_files().join(r"GitHub CLI\gh.exe")];
+            k.extend(paths::env_dir("LOCALAPPDATA").map(|l| l.join(r"Programs\GitHub CLI\gh.exe")));
+            k
+        } else {
+            paths::unix_bin_dirs("gh")
+        };
+        let gh = paths::find("gh", &known)
             .ok_or("gh not found: install GitHub CLI, then run `gh auth login`")?;
         vlog!("gh: {}", gh.display());
         let path = cfg.path.trim_matches('/');

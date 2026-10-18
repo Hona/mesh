@@ -31,7 +31,16 @@ struct Status {
 /// Address + online state for each host found, in one `tailscale status` call.
 /// A host matches a node's MagicDNS label first, then its HostName (case-insensitive).
 pub(crate) fn peers(hosts: &[&str]) -> Result<BTreeMap<String, Peer>, String> {
-    let bin = paths::find("tailscale").ok_or("tailscale not found")?;
+    let mut known = paths::unix_bin_dirs("tailscale");
+    if cfg!(windows) {
+        known = vec![paths::program_files().join(r"Tailscale\tailscale.exe")];
+    } else if cfg!(target_os = "macos") {
+        known.insert(
+            0,
+            "/Applications/Tailscale.app/Contents/MacOS/Tailscale".into(),
+        );
+    }
+    let bin = paths::find("tailscale", &known).ok_or("tailscale not found")?;
     vlog!("{} status --json", bin.display());
     let out = Command::new(&bin)
         .args(["status", "--json"])
