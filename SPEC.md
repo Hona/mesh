@@ -11,30 +11,33 @@ When a design change is agreed, update this file in the same change.
 
 ## 1. Rules (non-negotiable)
 
-1. **No automated tests. Ever.** No unit, integration, e2e, snapshot, or any other automated
+1. **Performance first.** Low CPU and RAM; low latency and high throughput between devices.
+   Never spawn a helper process where an OS API or a file read works. Minimize process spawns
+   and network round trips. Parallelize independent work. Stream large output, don't buffer it.
+2. **No automated tests. Ever.** No unit, integration, e2e, snapshot, or any other automated
    tests. No test files, no test dependencies, no test steps in CI. Verification is manual
    (run the command on real devices and look). CI only builds release binaries.
-2. **Early iteration speed beats everything.** Smallest change that works. No speculative
+3. **Early iteration speed beats everything else.** Smallest change that works. No speculative
    abstraction.
-3. **Automatic actions only pull.** Background/scheduled work never writes to the mesh repo.
+4. **Automatic actions only pull.** Background/scheduled work never writes to the mesh repo.
    Repo writes happen only from explicit commands (`up`, `update`, `rm`, `leave`) or the user
    pushing by hand.
-4. **Never break user space.** Mesh only adds marked managed blocks or mesh-owned files, all
+5. **Never break user space.** Mesh only adds marked managed blocks or mesh-owned files, all
    removable by `mesh leave`. It never edits `sshd_config`, never changes a default shell, never
    rewrites lines it didn't write. The one deliberate exception: `~/.config/opencode/AGENTS.md`
    is mesh-owned (see §7.4), with backups.
-5. **Opt-in targeting.** Commands reach only devices the user names (§5.1).
-6. **Raw, unopinionated tools.** Two MCP tools (`status`, `exec`). No task-specific tools.
+6. **Opt-in targeting.** Commands reach only devices the user names (§5.1).
+7. **Raw, unopinionated tools.** Two MCP tools (`status`, `exec`). No task-specific tools.
    Everything else is composed from `mesh exec <device> opencode …` or plain commands.
-7. **No master.** Every device is equal. Any device can join, leave, go offline, or come back
+8. **No master.** Every device is equal. Any device can join, leave, go offline, or come back
    at any time.
-8. **Tiny.** Rust stable. Dependencies: `serde` + `serde_json` only (ask before adding any
+9. **Tiny.** Rust stable. Dependencies: `serde` + `serde_json` only (ask before adding any
    crate). No async runtime, no TLS, no git library, no CLI framework. Shell out to `gh`,
    `ssh`, `scp`, `ssh-keygen`, `tailscale`, `opencode`.
-9. **One-time setup does every privileged / permission step.** `mesh up` walks the user through
-   all of it while they're at the device. After that nothing prompts; `sync`/`status` only
-   report problems.
-10. **One concept, one name.** Each MCP tool is exactly a CLI command: same name, same
+10. **One-time setup does every privileged / permission step.** `mesh up` walks the user through
+    all of it while they're at the device. After that nothing prompts; `sync`/`status` only
+    report problems.
+11. **One concept, one name.** Each MCP tool is exactly a CLI command: same name, same
     arguments, same JSON as `--json`.
 
 ## 2. Invariants (assumed on every device)
@@ -63,7 +66,7 @@ known install locations, not just PATH.
 
 ```
 Cargo.toml
-src/            # one crate; bins: mesh, meshw (Windows-only windowless build)
+src/            # one package: lib + bins mesh, meshw (Windows-only windowless build); §4.5
 skill/SKILL.md  # the built-in mesh skill, embedded into the binary (include_str!)
 schema/v1.json  # JSON schema for mesh.json
 install.sh      # macOS/Linux installer (fetched via gh)
@@ -108,7 +111,7 @@ Not in v1: `sources` (pulling skills from other people's repos).
 ```jsonc
 {
   "name": "blade",               // mesh device name
-  "tailscale": "lukeblade",      // Tailscale hostname; IP is resolved locally at sync time
+  "host": "lukeblade",           // network host name (Tailscale name); address resolved locally at sync time
   "os": "windows",               // linux | macos | windows
   "arch": "x64",                 // x64 | arm64
   "shell": "powershell",         // the SSH server's actual default shell (used by `exec -c`)
@@ -134,7 +137,8 @@ State dir: `~/.local/share/opencode-mesh/` (respect `XDG_DATA_HOME`) on Linux/ma
 `%LOCALAPPDATA%\opencode-mesh\` on Windows.
 
 ```
-state.json        # { "repo", "path", "branch", "device", "synced": "<commit sha>" }
+state.json        # { "registry": { "kind": "github", "repo", "path", "branch" },
+                  #   "device", "synced": "<commit sha>" }
 id_ed25519(.pub)  # this device's mesh key (permissions locked to the user)
 ssh_config        # generated; used via `ssh -F` for every mesh connection
 known_hosts       # generated from devices/*.host.pub
@@ -146,6 +150,33 @@ log/              # background run logs
 Installed binary: `~/.local/bin/mesh` (Linux/macOS);
 `%LOCALAPPDATA%\Programs\mesh\{mesh,meshw}.exe` (Windows, added to user PATH).
 Everything internal (MCP registration, remote handoff, scheduled tasks) uses absolute paths.
+
+### 4.5 Architecture (`src/`)
+
+One package `mesh`: a library plus thin binaries.
+
+```
+lib.rs          module declarations only
+main.rs         bin `mesh`: parse args → app → exit code
+bin/meshw.rs    bin `meshw`, Windows windowless build (Phase 2)
+cli/            argument parsing, help, text + JSON rendering
+app/            commands (sync, status, up, exec, …): orchestration only
+model/          plain data: Mesh, Device, Target, State, reports
+registry/       where the mesh lives            → github.rs (the only place that runs `gh`)
+network/        how devices are found / online  → tailscale.rs (the only place that runs `tailscale`)
+transport/      how commands reach devices      → ssh.rs; mux.rs, frame.rs (§6.5, Phase 3)
+host/           this machine's OS integration   → paths, processes, admin check, opencode discovery
+mcp/            stdio MCP server (§8, Phase 3)
+```
+
+- `cli` → `app` → `registry`, `network`, `transport`, `host`, `model`.
+- Backends (`registry`, `network`, `transport`, `host`) depend only on `model` (and `host` for
+  paths), never on `app`/`cli` or on each other's internals. They return `model` types, never raw
+  `gh`/`tailscale` JSON.
+- One backend each today. No traits, backend enums, or plugin layers; keep each backend's public
+  surface small so a second one (e.g. plain SSH without Tailscale, a web registry) is a local
+  change. Selection happens in one place (`registry::open`).
+- Idiomatic Rust: `pub(crate)` by default, `cargo fmt`, `cargo clippy` clean.
 
 ## 5. CLI
 
@@ -329,8 +360,11 @@ mesh sync [--force]
 
 Pull-only. Never writes to the repo.
 
-1. List the repo tree in one call (`gh api repos/{repo}/git/trees/{branch}?recursive=1`),
-   compare per-file shas with `cache/`, download only changed blobs.
+1. Fetch the branch head commit (one call). If it equals `synced` and there's no `--force`,
+   skip the listing, downloads and network lookup (`ssh_config`/`known_hosts` stay as they
+   are); only the local, spawn-free checks of step 2 run. Otherwise list the repo tree in one
+   call (`gh api repos/{repo}/git/trees/{commit}?recursive=1`), compare per-file shas with
+   `cache/`, download only changed blobs, in parallel.
 2. Apply locally:
    - authorized keys: rewrite the managed block (§7.3) from `devices/*.pub`;
    - `<state>/known_hosts` from `devices/*.host.pub`;
@@ -405,7 +439,7 @@ and `known_hosts` are never read or modified by mesh connections. Generated conf
 
 ```
 Host blade
-  HostName 100.87.251.43          # current Tailscale IP, resolved locally at sync
+  HostName 100.87.251.43          # current Tailscale IP, resolved locally at sync (network backend)
   User lukem
   IdentityFile <state>/id_ed25519
   IdentitiesOnly yes
@@ -454,6 +488,22 @@ quoted absolute mesh path + fixed flags above.
    desktop app's bundled `resources\opencode-cli.exe`).
 
 Only `version`, `url`, `pid` are read from `service.json` — never `password`.
+
+### 6.5 Persistent connections (Phase 3)
+
+- A local background `mesh` process (the "mux") starts on first use, keeps one SSH connection
+  per device, and exits after ~10 min idle.
+- Each connection runs the remote mesh in a long-lived serve mode that handles many concurrent
+  commands over the one SSH channel.
+- Binary length-prefixed frames per command id: `start` (envelope), `stdin`, `stdout`,
+  `stderr`, `exit`, `cancel`.
+- CLI invocations and the MCP server talk to the local mux over a local socket (named pipe on
+  Windows, unix socket elsewhere).
+- Goal: after the first command, each exec costs one network round trip + the command's own
+  startup. No SSH handshake and no remote shell startup per command (Windows SSH runs every
+  command through the default shell; PowerShell costs 0.3–0.8 s).
+- `-t` interactive sessions keep using plain `ssh -t`. If the mux can't start, fall back to a
+  direct one-shot `ssh` (the §6.2 handoff).
 
 ## 7. Setup details
 
@@ -598,7 +648,7 @@ Text rendering for the model:
 | 0 | Spike: key + handoff between adais and blade by hand | `mesh exec blade opencode --version` from adais |
 | 1 | `sync`, `status` | repo pulled, ssh files generated, status table right |
 | 2 | `up` (create + join, setup steps, conflicts, MCP, schedule) | fresh join of adais and blade |
-| 3 | `exec` (full), `cp`, `mcp`, skill | agent on adais drives blade via `mesh_exec` |
+| 3 | `exec` (full, over persistent connections §6.5), `cp`, `mcp`, skill | agent on adais drives blade via `mesh_exec` |
 | 4 | `update`, `rm`, `leave`, release CI, installers | mesh-wide update from one command |
 
 ## 12. Open items (verify manually during phases)
