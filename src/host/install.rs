@@ -33,8 +33,34 @@ fn same(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// Installed file names: mesh (+ the windowless meshw on Windows).
+pub(crate) fn names() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["mesh.exe", "meshw.exe"]
+    } else {
+        &["mesh"]
+    }
+}
+
+/// Delete leftovers of earlier rename-asides (`*.old`); still-running ones stay until next time.
+pub(crate) fn clean_old() {
+    for e in fs::read_dir(dir()).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().ends_with(".old") {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+}
+
+/// The installed mesh, if it is the same build as the running one (the mux runs from there so
+/// it never locks a build output or download folder).
+pub(crate) fn installed_copy() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let installed = dir().join(names()[0]);
+    same(&exe, &installed).then_some(installed)
+}
+
 /// Copy `src` over `dst`; a running `dst` (Windows) is renamed aside first.
-fn replace(src: &Path, dst: &Path) -> Result<(), String> {
+pub(crate) fn replace(src: &Path, dst: &Path) -> Result<(), String> {
     let name = dst
         .file_name()
         .unwrap_or_default()
@@ -58,17 +84,8 @@ pub(crate) fn install(check: bool) -> Result<Installed, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let src_dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
     let dir = dir();
-    // leftovers from earlier rename-asides; still-running ones stay until next time
-    for e in fs::read_dir(&dir).into_iter().flatten().flatten() {
-        if e.file_name().to_string_lossy().ends_with(".old") {
-            let _ = fs::remove_file(e.path());
-        }
-    }
-    let names: &[&str] = if cfg!(windows) {
-        &["mesh.exe", "meshw.exe"]
-    } else {
-        &["mesh"]
-    };
+    clean_old();
+    let names = names();
     let mut changed = false;
     for (i, name) in names.iter().enumerate() {
         let src = if i == 0 {

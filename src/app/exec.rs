@@ -2,7 +2,7 @@
 //! SSH handoff (§6.2). Callers get a stream of events and render them.
 
 use super::{Fail, R, VERSION, serve, store, sync};
-use crate::host::process;
+use crate::host::{install, process};
 use crate::model::{Device, Envelope, ExecResult, ExitInfo, Target};
 use crate::network;
 use crate::transport::frame::{CANCEL, EXIT, START, STDERR, STDIN, STDOUT};
@@ -57,7 +57,7 @@ fn mux_client() -> Option<mux::Client> {
     if let Some(c) = connect() {
         return Some(c);
     }
-    let exe = std::env::current_exe().ok()?;
+    let exe = install::installed_copy().or_else(|| std::env::current_exe().ok())?;
     let log = store::log_file("mux", &format!("start {}", exe.display()))?;
     process::spawn_detached(&exe, &["mux"], log).ok()?;
     for _ in 0..300 {
@@ -67,6 +67,13 @@ fn mux_client() -> Option<mux::Client> {
         }
     }
     None
+}
+
+/// Ask this build's mux to exit (mesh leave deletes the state dir it logs into).
+pub(crate) fn stop_mux() {
+    if let Some(c) = mux::Client::connect(BUILD) {
+        c.quit();
+    }
 }
 
 /// Feed `input` to `sink` on its own thread; an empty chunk means EOF.

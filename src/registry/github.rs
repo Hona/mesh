@@ -1,7 +1,7 @@
 //! The only place that runs `gh`.
 
 use crate::host::{paths, process, vlog};
-use crate::model::{RegistryConfig, RepoFile};
+use crate::model::{RegistryConfig, Release, RepoFile};
 use serde::Deserialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -160,6 +160,52 @@ impl GitHub {
         if !out.status.success() {
             return Err(format!(
                 "gh repo create: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+
+    /// The repo's releases (drafts excluded), newest first.
+    pub(crate) fn releases(&self) -> Result<Vec<Release>, String> {
+        let endpoint = format!("repos/{}/releases?per_page=30", self.repo);
+        let out = self.run(self.api(None, &endpoint), &endpoint)?;
+        let v: serde_json::Value = serde_json::from_slice(&out).map_err(|e| e.to_string())?;
+        Ok(v.as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| !r["draft"].as_bool().unwrap_or(false))
+            .filter_map(|r| {
+                let tag = r["tag_name"].as_str()?.to_string();
+                Some(Release {
+                    tag,
+                    prerelease: r["prerelease"].as_bool().unwrap_or(false),
+                })
+            })
+            .collect())
+    }
+
+    /// Download release assets `names` of `tag` into `dir`.
+    pub(crate) fn download(&self, tag: &str, names: &[String], dir: &Path) -> Result<(), String> {
+        vlog!("gh release download {tag} {}", names.join(" "));
+        let mut c = process::command(&self.gh);
+        c.args([
+            "release",
+            "download",
+            tag,
+            "-R",
+            &self.repo,
+            "--clobber",
+            "-D",
+        ])
+        .arg(dir);
+        for n in names {
+            c.args(["-p", n]);
+        }
+        let out = c.output().map_err(|e| format!("gh: {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "gh release download {tag}: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ));
         }

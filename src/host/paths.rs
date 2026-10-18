@@ -91,6 +91,16 @@ pub(crate) fn detect_shell() -> (String, PathBuf) {
     )
 }
 
+/// SPEC names: (linux | macos | windows, x64 | arm64).
+pub(crate) fn os_arch() -> (&'static str, &'static str) {
+    let arch = match env::consts::ARCH {
+        "x86_64" => "x64",
+        "aarch64" => "arm64",
+        a => a,
+    };
+    (env::consts::OS, arch)
+}
+
 pub(crate) fn program_files() -> PathBuf {
     env_dir("ProgramFiles").unwrap_or_else(|| PathBuf::from(r"C:\Program Files"))
 }

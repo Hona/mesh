@@ -40,17 +40,67 @@ const MESH_JSON: &str = "{\n  \"$schema\": \"https://raw.githubusercontent.com/H
 
 /// The privileged Windows steps, done by one elevated `meshw elevated <hex plan>`.
 #[derive(Serialize, Deserialize, Default)]
-struct Plan {
+pub(crate) struct Plan {
     install: bool,
     start: bool,
     keys_file: Option<String>,
     keys_task: Option<(String, u64)>,
     own_key: Option<String>,
+    /// mesh leave: remove the keys block, the keys task and the task folder.
+    #[serde(default)]
+    leave: bool,
+}
+
+/// Run `plan` through one UAC prompt and wait for it (SPEC §7.1).
+#[cfg(windows)]
+pub(crate) fn elevate(
+    plan: &Plan,
+    meshw: &Path,
+    rerun: &str,
+    progress: &dyn Fn(Duration),
+) -> R<()> {
+    use crate::host::win::{self, Elevated};
+    let hex = serve::hex(&serde_json::to_vec(plan).unwrap_or_default());
+    let log = paths::state_dir().join(r"log\elevated.log");
+    let again = format!(
+        "re-run `{rerun}` and approve the UAC prompt, or run this in an admin terminal:\n  \"{}\" elevated {hex}",
+        meshw.display()
+    );
+    let wait = (Duration::from_secs(180), Duration::from_secs(1800));
+    match win::run_elevated(meshw, &format!("elevated {hex}"), wait.0, wait.1, progress) {
+        Elevated::Exit(0) => Ok(()),
+        Elevated::Exit(n) => Err(Fail(
+            1,
+            format!("the elevated step failed (exit {n}); see {}", log.display()),
+        )),
+        Elevated::Declined => Err(Fail(3, format!("UAC was declined: {again}"))),
+        Elevated::NoAnswer => Err(Fail(3, format!("no answer to the UAC prompt: {again}"))),
+        Elevated::TimedOut => Err(Fail(
+            3,
+            format!(
+                "the elevated step is still running after 30 min; see {}",
+                log.display()
+            ),
+        )),
+        Elevated::Failed(e) => Err(Fail(3, format!("couldn't elevate ({e}): {again}"))),
+    }
 }
 
 impl Plan {
+    /// mesh leave's privileged part.
+    #[cfg(windows)]
+    pub(crate) fn leave() -> Plan {
+        Plan {
+            leave: true,
+            ..Default::default()
+        }
+    }
+
     fn describe(&self) -> String {
         let mut v = Vec::new();
+        if self.leave {
+            v.push("remove the keys block and the keys task");
+        }
         if self.install {
             v.push("install OpenSSH Server");
         } else if self.start {
@@ -111,15 +161,6 @@ impl Up<'_> {
             done.into()
         }
     }
-}
-
-fn os_arch() -> (&'static str, &'static str) {
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "x64",
-        "aarch64" => "arm64",
-        a => a,
-    };
-    (std::env::consts::OS, arch)
 }
 
 fn user() -> String {
@@ -375,7 +416,6 @@ impl Up<'_> {
         }
         #[cfg(windows)]
         {
-            use crate::host::win::{self, Elevated};
             let every = schedule::parse_interval(store::mesh().interval.as_deref());
             let meshw = inst.meshw.clone().unwrap_or_else(|| inst.mesh.clone());
             let keys = srv.keys.clone().unwrap_or_default();
@@ -413,45 +453,7 @@ impl Up<'_> {
                     self.warn("sshd", "installing OpenSSH Server via Windows Update: this can take several minutes");
                 }
                 self.warn("sshd", format!("{todo}: approve the UAC prompt"));
-                let hex = serve::hex(&serde_json::to_vec(&plan).unwrap_or_default());
-                let log = paths::state_dir().join(r"log\elevated.log");
-                let again = format!(
-                    "re-run `mesh up` and approve the UAC prompt, or run this in an admin terminal:\n  \"{}\" elevated {hex}",
-                    meshw.display()
-                );
-                match win::run_elevated(
-                    &meshw,
-                    &format!("elevated {hex}"),
-                    Duration::from_secs(180),
-                    Duration::from_secs(1800),
-                    &|t| (self.ui.progress)("sshd", t),
-                ) {
-                    Elevated::Exit(0) => {}
-                    Elevated::Exit(n) => {
-                        return Err(Fail(
-                            1,
-                            format!("the elevated step failed (exit {n}); see {}", log.display()),
-                        ));
-                    }
-                    Elevated::Declined => {
-                        return Err(Fail(3, format!("UAC was declined: {again}")));
-                    }
-                    Elevated::NoAnswer => {
-                        return Err(Fail(3, format!("no answer to the UAC prompt: {again}")));
-                    }
-                    Elevated::TimedOut => {
-                        return Err(Fail(
-                            3,
-                            format!(
-                                "the elevated step is still running after 30 min; see {}",
-                                log.display()
-                            ),
-                        ));
-                    }
-                    Elevated::Failed(e) => {
-                        return Err(Fail(3, format!("couldn't elevate ({e}): {again}")));
-                    }
-                }
+                elevate(&plan, &meshw, "mesh up", &|t| (self.ui.progress)("sshd", t))?;
             }
             let srv = ssh::server();
             if !srv.running {
@@ -645,7 +647,7 @@ impl Up<'_> {
         host: &str,
         inst: &Installed,
     ) -> R<bool> {
-        let (os, arch) = os_arch();
+        let (os, arch) = paths::os_arch();
         let d = Device {
             name: name.into(),
             host: host.into(),
@@ -953,6 +955,10 @@ pub(crate) fn elevated(hex: &str) -> R<i32> {
                 false,
             )?;
             println!("keys task: {}", schedule::KEYS_TASK);
+        }
+        if plan.leave {
+            println!("keys block removed: {}", ssh::unauthorize()?);
+            println!("keys task removed: {}", schedule::remove_keys_task()?);
         }
     }
     Ok(0)

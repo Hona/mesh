@@ -2,7 +2,7 @@
 //! every local mesh process over the local socket. Frames from clients are routed to the
 //! device link with the ids rewritten; replies are routed back.
 
-use super::frame::{self, CANCEL, EXIT, HELLO, PING, START, STDERR, STDIN, STDOUT};
+use super::frame::{self, CANCEL, EXIT, HELLO, PING, QUIT, START, STDERR, STDIN, STDOUT};
 use crate::host::ipc::{self, Conn};
 use crate::model::{Envelope, ExitInfo};
 use std::collections::HashMap;
@@ -290,6 +290,7 @@ impl Mux {
                         let _ = link.send(f.kind, *rid, &f.data);
                     }
                 }
+                QUIT => std::process::exit(0),
                 _ => {}
             }
         }
@@ -354,6 +355,11 @@ impl Client {
     pub(crate) fn send(&self, kind: u8, id: u32, data: &[u8]) -> io::Result<()> {
         let _g = lock(&self.w);
         frame::write(&mut &*self.conn, kind, id, data)
+    }
+
+    /// Ask this build's mux to exit (mesh leave).
+    pub(crate) fn quit(&self) {
+        let _ = self.send(QUIT, 0, &[]);
     }
 
     /// Frames from the mux; read from one thread only.

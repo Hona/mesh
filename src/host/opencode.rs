@@ -1,4 +1,4 @@
-//! Finding and asking the local opencode install (SPEC §6.4).
+//! Finding and asking the local opencode install (SPEC Â§6.4).
 
 use super::{paths, process, vlog};
 use crate::model::Opencode;
@@ -152,7 +152,7 @@ pub(crate) fn probe() -> Option<Opencode> {
     }
 }
 
-/// The opencode binary `mesh exec <device> opencode …` runs (§6.4).
+/// The opencode binary `mesh exec <device> opencode â€¦` runs (Â§6.4).
 pub(crate) fn bin() -> Option<PathBuf> {
     find(service().as_ref()).map(|(p, _)| p)
 }
@@ -168,8 +168,8 @@ pub(crate) fn installed() -> Option<(String, Option<u32>)> {
     Some((v.unwrap_or_else(|| "?".into()), pid))
 }
 
-/// Command of the global MCP server entry `name`, if any.
-pub(crate) fn mcp_entry(name: &str) -> Result<Option<Vec<String>>, String> {
+/// The global config document holding MCP server `name`, and its command.
+fn mcp_doc(name: &str) -> Result<Option<(PathBuf, Vec<String>)>, String> {
     let bin = bin().ok_or("opencode not found")?;
     let out = process::command(bin)
         .args(["debug", "config"])
@@ -180,10 +180,10 @@ pub(crate) fn mcp_entry(name: &str) -> Result<Option<Vec<String>>, String> {
         serde_json::from_slice(&out.stdout).map_err(|e| format!("opencode debug config: {e}"))?;
     let global = paths::config_dir();
     for src in v.as_array().into_iter().flatten() {
-        let in_global = src["path"]
-            .as_str()
-            .is_some_and(|p| Path::new(p).parent() == Some(global.as_path()));
-        if !in_global {
+        let Some(path) = src["path"].as_str().map(PathBuf::from) else {
+            continue;
+        };
+        if path.parent() != Some(global.as_path()) {
             continue;
         }
         for entry in [
@@ -191,15 +191,21 @@ pub(crate) fn mcp_entry(name: &str) -> Result<Option<Vec<String>>, String> {
             &src["info"]["mcp"][name],
         ] {
             if let Some(cmd) = entry["command"].as_array() {
-                return Ok(Some(
+                return Ok(Some((
+                    path,
                     cmd.iter()
                         .filter_map(|c| c.as_str().map(String::from))
                         .collect(),
-                ));
+                )));
             }
         }
     }
     Ok(None)
+}
+
+/// Command of the global MCP server entry `name`, if any.
+pub(crate) fn mcp_entry(name: &str) -> Result<Option<Vec<String>>, String> {
+    Ok(mcp_doc(name)?.map(|(_, cmd)| cmd))
 }
 
 /// `opencode mcp add <name> --global -- <command…>`
@@ -219,47 +225,38 @@ pub(crate) fn mcp_add(name: &str, command: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// Restart MCP server `name` in every loaded opencode location so a replaced binary is used.
-/// Returns how many locations were reconnected (0 if the service isn't running).
-pub(crate) fn reconnect_mcp(name: &str) -> Result<usize, String> {
+/// Run the `api` operations `ops` for MCP server `name` in every loaded location, in parallel.
+/// None if the service isn't running or the locations can't be listed; else how many succeeded.
+fn each_location(name: &str, ops: &[&str]) -> Option<usize> {
     let svc = service();
     if !svc.as_ref().is_some_and(|s| s.exe.is_some()) {
-        return Ok(0);
+        return None;
     }
-    let (bin, _) = find(svc.as_ref()).ok_or("opencode not found")?;
+    let (bin, _) = find(svc.as_ref())?;
     let out = process::command(&bin)
         .args(["api", "debug.location.list"])
         .output()
-        .map_err(|e| e.to_string())?;
-    let locations: Vec<String> = serde_json::from_slice::<serde_json::Value>(&out.stdout)
-        .ok()
-        .and_then(|v| {
-            v.as_array().map(|a| {
-                a.iter()
-                    .filter_map(|l| l["directory"].as_str().map(String::from))
-                    .collect()
-            })
-        })
-        .unwrap_or_default();
-    if locations.is_empty() {
-        return reload().map(usize::from);
-    }
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let locations: Vec<String> = v
+        .as_array()?
+        .iter()
+        .filter_map(|l| l["directory"].as_str().map(String::from))
+        .collect();
     let server = format!("server={name}");
-    let reconnected = std::thread::scope(|s| {
+    let done = std::thread::scope(|s| {
         let handles: Vec<_> = locations
             .iter()
             .map(|loc| {
                 let (bin, server) = (&bin, &server);
                 s.spawn(move || {
                     let loc = format!("location[directory]={loc}");
-                    ["experimental.mcp.disconnect", "experimental.mcp.connect"]
-                        .iter()
-                        .all(|op| {
-                            process::command(bin)
-                                .args(["api", op, "--param", server, "--param", &loc])
-                                .output()
-                                .is_ok_and(|o| o.status.success())
-                        })
+                    ops.iter().all(|op| {
+                        process::command(bin)
+                            .args(["api", op, "--param", server, "--param", &loc])
+                            .output()
+                            .is_ok_and(|o| o.status.success())
+                    })
                 })
             })
             .collect();
@@ -269,7 +266,183 @@ pub(crate) fn reconnect_mcp(name: &str) -> Result<usize, String> {
             .filter(|ok| *ok)
             .count()
     });
-    Ok(reconnected)
+    Some(done)
+}
+
+/// Restart MCP server `name` in every loaded opencode location so a replaced binary is used
+/// (`opencode reload` if the locations can't be listed). Ok(n locations).
+pub(crate) fn reconnect_mcp(name: &str) -> Result<usize, String> {
+    if service().is_none_or(|s| s.exe.is_none()) {
+        return Ok(0);
+    }
+    match each_location(
+        name,
+        &["experimental.mcp.disconnect", "experimental.mcp.connect"],
+    ) {
+        Some(n) => Ok(n),
+        None => reload().map(usize::from),
+    }
+}
+
+/// Undo `mcp_add` (mesh leave): cut the entry out of the global config text (only if its command
+/// is `ours`; everything else stays byte for byte), then drop the running servers.
+pub(crate) fn mcp_unregister(name: &str, ours: &[String]) -> Result<bool, String> {
+    let Some((path, cmd)) = mcp_doc(name)? else {
+        return Ok(false);
+    };
+    if cmd != ours {
+        return Err(format!(
+            "the \"{name}\" entry ({}) isn't mesh's; left alone",
+            cmd.join(" ")
+        ));
+    }
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let new = jsonc_remove(&text, &["mcp", "servers", name])
+        .or_else(|| jsonc_remove(&text, &["mcp", name]))
+        .ok_or_else(|| format!("couldn't find \"{name}\" in {}", path.display()))?;
+    std::fs::write(&path, new).map_err(|e| format!("{}: {e}", path.display()))?;
+    let _ = each_location(name, &["experimental.mcp.remove"]);
+    Ok(true)
+}
+
+/// Cut object member `path` out of JSONC `text` (with its line and comma); None if absent.
+fn jsonc_remove(text: &str, path: &[&str]) -> Option<String> {
+    let b = text.as_bytes();
+    let mut i = 0;
+    let (start, end) = member(b, &mut i, path)?;
+    let mut s = start;
+    while s > 0 && matches!(b[s - 1], b' ' | b'\t') {
+        s -= 1;
+    }
+    let mut e = end;
+    while e < b.len() && matches!(b[e], b' ' | b'\t') {
+        e += 1;
+    }
+    if e < b.len() && b[e] == b',' {
+        e += 1;
+        while e < b.len() && matches!(b[e], b' ' | b'\t' | b'\r') {
+            e += 1;
+        }
+        if e < b.len() && b[e] == b'\n' {
+            e += 1;
+        }
+        return Some(format!("{}{}", &text[..s], &text[e..]));
+    }
+    // last member: drop the comma before it instead (strict JSON has no trailing commas)
+    let mut p = s;
+    while p > 0 && b[p - 1].is_ascii_whitespace() {
+        p -= 1;
+    }
+    let cut = if p > 0 && b[p - 1] == b',' { p - 1 } else { s };
+    Some(format!("{}{}", &text[..cut], &text[end..]))
+}
+
+fn skip_ws(b: &[u8], i: &mut usize) {
+    loop {
+        while *i < b.len() && b[*i].is_ascii_whitespace() {
+            *i += 1;
+        }
+        if b[*i..].starts_with(b"//") {
+            while *i < b.len() && b[*i] != b'\n' {
+                *i += 1;
+            }
+        } else if b[*i..].starts_with(b"/*") {
+            *i += 2;
+            while *i < b.len() && !b[*i..].starts_with(b"*/") {
+                *i += 1;
+            }
+            *i = (*i + 2).min(b.len());
+        } else {
+            return;
+        }
+    }
+}
+
+fn string<'a>(b: &'a [u8], i: &mut usize) -> Option<&'a [u8]> {
+    if b.get(*i) != Some(&b'"') {
+        return None;
+    }
+    *i += 1;
+    let start = *i;
+    while *i < b.len() && b[*i] != b'"' {
+        *i += if b[*i] == b'\\' { 2 } else { 1 };
+    }
+    let s = b.get(start..*i)?;
+    *i += 1;
+    Some(s)
+}
+
+fn skip_value(b: &[u8], i: &mut usize) -> Option<()> {
+    skip_ws(b, i);
+    match *b.get(*i)? {
+        b'"' => string(b, i).map(drop),
+        b'{' | b'[' => {
+            let mut depth = 0;
+            loop {
+                skip_ws(b, i);
+                match *b.get(*i)? {
+                    b'"' => {
+                        string(b, i)?;
+                    }
+                    b'{' | b'[' => {
+                        depth += 1;
+                        *i += 1;
+                    }
+                    b'}' | b']' => {
+                        depth -= 1;
+                        *i += 1;
+                        if depth == 0 {
+                            return Some(());
+                        }
+                    }
+                    _ => *i += 1,
+                }
+            }
+        }
+        _ => {
+            while *i < b.len()
+                && !matches!(b[*i], b',' | b'}' | b']')
+                && !b[*i].is_ascii_whitespace()
+            {
+                *i += 1;
+            }
+            Some(())
+        }
+    }
+}
+
+/// Span (key start, value end) of member `path` inside the object at `i`.
+fn member(b: &[u8], i: &mut usize, path: &[&str]) -> Option<(usize, usize)> {
+    skip_ws(b, i);
+    if b.get(*i) != Some(&b'{') {
+        return None;
+    }
+    *i += 1;
+    loop {
+        skip_ws(b, i);
+        if b.get(*i)? == &b'}' {
+            return None;
+        }
+        let key_start = *i;
+        let key = string(b, i)?;
+        skip_ws(b, i);
+        if b.get(*i)? != &b':' {
+            return None;
+        }
+        *i += 1;
+        if key == path[0].as_bytes() {
+            if path.len() == 1 {
+                skip_value(b, i)?;
+                return Some((key_start, *i));
+            }
+            return member(b, i, &path[1..]);
+        }
+        skip_value(b, i)?;
+        skip_ws(b, i);
+        if b.get(*i) == Some(&b',') {
+            *i += 1;
+        }
+    }
 }
 
 /// `opencode reload` if the service is running. Ok(false) if it isn't.

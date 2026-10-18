@@ -125,19 +125,49 @@ pub(crate) fn authorize(devices: &[Device]) -> Result<bool, String> {
     if new == old {
         return Ok(false);
     }
+    write_keys(&path, &new)?;
+    Ok(true)
+}
+
+/// Remove the managed block (mesh leave), keeping every other line. Ok(true) if it was there.
+pub(crate) fn unauthorize() -> Result<bool, String> {
+    let path = keys_file()?;
+    let old = match fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(io_reason(&path, e)),
+    };
+    if !old.contains(BEGIN) {
+        return Ok(false);
+    }
+    let new = with_block(&old, "").ok_or_else(|| {
+        format!(
+            "{}: managed block markers are broken, fix them by hand",
+            path.display()
+        )
+    })?;
+    write_keys(&path, &new)?;
+    Ok(true)
+}
+
+/// Write in place so the file keeps its ACL / permissions.
+fn write_keys(path: &Path, text: &str) -> Result<(), String> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).map_err(|e| io_reason(dir, e))?;
     }
-    // Write in place so the file keeps its ACL / permissions.
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open(&path)
-        .map_err(|e| io_reason(&path, e))?;
-    f.write_all(new.as_bytes())
-        .map_err(|e| io_reason(&path, e))?;
-    Ok(true)
+        .open(path)
+        .map_err(|e| io_reason(path, e))?;
+    f.write_all(text.as_bytes()).map_err(|e| io_reason(path, e))
+}
+
+/// Whether the keys file needs admin to write (then `leave` removes the block elevated).
+#[cfg(windows)]
+pub(crate) fn keys_need_admin() -> bool {
+    server().keys_admin
 }
 
 fn io_reason(p: &Path, e: std::io::Error) -> String {
@@ -587,6 +617,24 @@ pub(crate) fn include_state(devices: &[Device]) -> Include {
         }
     }
     Include::Absent
+}
+
+/// Remove the `Include` line `add_include` wrote (mesh leave). Ok(true) if it was there.
+pub(crate) fn remove_include() -> Result<bool, String> {
+    let p = user_config();
+    let Ok(text) = fs::read_to_string(&p) else {
+        return Ok(false);
+    };
+    let line = include_line();
+    if !text.lines().any(|l| l.trim() == line) {
+        return Ok(false);
+    }
+    let new: String = text
+        .split_inclusive('\n')
+        .filter(|l| l.trim() != line)
+        .collect();
+    fs::write(&p, new).map_err(|e| format!("{}: {e}", p.display()))?;
+    Ok(true)
 }
 
 /// Prepend the one `Include` line (everything else in the file is kept as is).

@@ -2,8 +2,8 @@
 
 use super::store::{self, Index};
 use super::{Fail, R, VERSION};
-use crate::host::{opencode, paths, vlog};
-use crate::model::{Device, RepoFile, SyncReport};
+use crate::host::{install, opencode, paths, vlog};
+use crate::model::{Device, RepoFile, SyncReport, cmp_versions};
 use crate::{network, registry, transport};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -64,14 +64,22 @@ pub(crate) fn run(force: bool, keys_only: bool) -> R<SyncReport> {
             Err(e) => r.warnings.push(format!("opencode reload failed: {e}")),
         }
     }
-    if let Some(pin) = store::mesh().pin.filter(|p| p != VERSION) {
-        r.warnings.push(format!(
-            "mesh.json pins mesh {pin} (this is {VERSION}): self-update isn't implemented yet"
-        ));
-    }
     state.synced = Some(commit.clone());
     store::write_state(&state)?;
     r.commit = Some(commit);
+    // Step 3: converge to the mesh's pinned version (either direction).
+    install::clean_old();
+    let pin = store::mesh()
+        .pin
+        .map(|p| p.trim_start_matches('v').to_string());
+    if let Some(pin) = pin.filter(|p| cmp_versions(p, VERSION) != std::cmp::Ordering::Equal) {
+        match super::update::converge(&pin) {
+            Ok(()) => r.applied.push(format!("mesh {VERSION} → {pin} (pinned)")),
+            Err(e) => r
+                .warnings
+                .push(format!("couldn't move to the pinned mesh {pin}: {e}")),
+        }
+    }
     Ok(finish(r))
 }
 

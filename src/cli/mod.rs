@@ -80,7 +80,9 @@ pub fn run(args: Vec<String>) -> i32 {
         "mcp" => Ok(crate::mcp::run()),
         "mux" => app::mux::run(),
         "elevated" => up::elevated(rest.first().map_or("", String::as_str)),
-        "rm" | "leave" | "update" => Err(Fail(1, format!("{cmd}: not implemented yet"))),
+        "update" => update(&rest),
+        "rm" => rm(&rest),
+        "leave" => leave(&rest),
         _ => Err(Fail(
             2,
             format!("unknown command {cmd:?} (see mesh --help)"),
@@ -202,25 +204,7 @@ fn up(args: &[String], out: &Out) -> Result<i32, Fail> {
             render::step(&s);
         }
     };
-    let ask = |q: &str, choices: &str| -> char {
-        loop {
-            print!("  ? {q} ");
-            let _ = std::io::stdout().flush();
-            let mut line = String::new();
-            if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
-                return choices.chars().next().unwrap_or('n');
-            }
-            if let Some(c) = line
-                .trim()
-                .chars()
-                .next()
-                .map(|c| c.to_ascii_lowercase())
-                .filter(|c| choices.contains(*c))
-            {
-                return c;
-            }
-        }
-    };
+    let ask = |q: &str, choices: &str| -> char { prompt(q, choices) };
     let progress = |name: &str, t: std::time::Duration| {
         if !json {
             render::progress(name, t);
@@ -341,4 +325,72 @@ fn cp(args: &[String]) -> Result<i32, Fail> {
         return Err(usage("cp", "usage: mesh cp [-r] <src> <dst>"));
     };
     cp::run(recursive, src, dst)
+}
+
+/// Ask until one of `choices` is typed; EOF picks the first choice.
+fn prompt(q: &str, choices: &str) -> char {
+    loop {
+        print!("  ? {q} ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).unwrap_or(0) == 0 {
+            return choices.chars().next().unwrap_or('n');
+        }
+        let c = line.trim().chars().next().map(|c| c.to_ascii_lowercase());
+        if let Some(c) = c.filter(|c| choices.contains(*c)) {
+            return c;
+        }
+    }
+}
+
+/// Yes/no confirmation; without a terminal it says no (pass --yes).
+fn confirm(q: &str) -> bool {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() {
+        eprintln!("mesh: not a terminal; pass --yes to confirm");
+        return false;
+    }
+    prompt(q, "ny") == 'y'
+}
+
+fn update(args: &[String]) -> Result<i32, Fail> {
+    let mut o = app::update::Opts {
+        version: None,
+        check: false,
+        resume: false,
+    };
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--version" => {
+                o.version = Some(
+                    it.next()
+                        .cloned()
+                        .ok_or_else(|| usage("update", "--version needs x.y.z"))?,
+                )
+            }
+            "--check" => o.check = true,
+            "--resume" => o.resume = true,
+            _ => return Err(usage("update", format!("unexpected argument {a:?}"))),
+        }
+    }
+    app::update::run(&o, &|s| render::step(&s))
+}
+
+fn rm(args: &[String]) -> Result<i32, Fail> {
+    let yes = args.iter().any(|a| a == "--yes" || a == "-y");
+    let names: Vec<&String> = args.iter().filter(|a| !a.starts_with('-')).collect();
+    let [name] = names.as_slice() else {
+        return Err(usage("rm", "usage: mesh rm <device> [--yes]"));
+    };
+    app::rm::rm(name, yes, &confirm, &|s| render::step(&s))
+}
+
+fn leave(args: &[String]) -> Result<i32, Fail> {
+    let yes = match args {
+        [] => false,
+        [a] if a == "--yes" || a == "-y" => true,
+        _ => return Err(usage("leave", "usage: mesh leave [--yes]")),
+    };
+    app::rm::leave(yes, &confirm, &|s| render::step(&s), &render::progress)
 }

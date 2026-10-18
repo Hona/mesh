@@ -135,6 +135,66 @@ pub(crate) fn ensure_task(
     r.map(|_| Outcome::Installed)
 }
 
+/// Delete a task; Ok(false) if it didn't exist.
+#[cfg(windows)]
+pub(crate) fn remove_task(name: &str) -> Result<bool, String> {
+    if run(command("schtasks").args(["/query", "/tn", name])).is_err() {
+        return Ok(false);
+    }
+    run(command("schtasks").args(["/delete", "/tn", name, "/f"])).map(|_| true)
+}
+
+/// Elevated (mesh leave): the keys task and the `\opencode-mesh` task folder.
+#[cfg(windows)]
+pub(crate) fn remove_keys_task() -> Result<bool, String> {
+    let removed = remove_task(KEYS_TASK)?;
+    let _ = remove_task(SYNC_TASK);
+    let script = "$s = New-Object -ComObject Schedule.Service; $s.Connect(); \
+        try { $s.GetFolder('\\').DeleteFolder('opencode-mesh', 0) } catch {}";
+    let _ =
+        run(command("powershell.exe").args(["-NoProfile", "-NonInteractive", "-Command", script]));
+    Ok(removed)
+}
+
+/// Undo `ensure_sync` (mesh leave). Ok(false) if there was nothing to remove.
+#[cfg(windows)]
+pub(crate) fn remove_sync() -> Result<bool, String> {
+    remove_task(SYNC_TASK)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn remove_sync() -> Result<bool, String> {
+    let dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| paths::home().join(".config"))
+        .join("systemd/user");
+    let timer = dir.join("opencode-mesh-sync.timer");
+    if !timer.exists() {
+        return Ok(false);
+    }
+    let _ =
+        run(command("systemctl").args(["--user", "disable", "--now", "opencode-mesh-sync.timer"]));
+    let _ = std::fs::remove_file(timer);
+    let _ = std::fs::remove_file(dir.join("opencode-mesh-sync.service"));
+    let _ = run(command("systemctl").args(["--user", "daemon-reload"]));
+    Ok(true)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn remove_sync() -> Result<bool, String> {
+    unsafe extern "C" {
+        fn getuid() -> u32;
+    }
+    let plist = paths::home().join("Library/LaunchAgents/opencode-mesh.sync.plist");
+    if !plist.exists() {
+        return Ok(false);
+    }
+    let label = format!("gui/{}/opencode-mesh.sync", unsafe { getuid() });
+    let _ = run(command("launchctl").args(["bootout", &label]));
+    std::fs::remove_file(&plist).map_err(|e| format!("{}: {e}", plist.display()))?;
+    Ok(true)
+}
+
 #[cfg(windows)]
 pub(crate) fn run_task(name: &str) -> Result<(), String> {
     run(command("schtasks").args(["/run", "/tn", name])).map(drop)

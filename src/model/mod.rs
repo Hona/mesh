@@ -187,6 +187,47 @@ pub(crate) struct SyncReport {
     pub warnings: Vec<String>,
 }
 
+/// A release of the tool repo.
+pub(crate) struct Release {
+    pub tag: String,
+    pub prerelease: bool,
+}
+
+/// Semver order: `0.1.0-dev.2 < 0.1.0-dev.10 < 0.1.0 < 0.2.0` (a leading `v` is ignored).
+pub(crate) fn cmp_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let parts = |v: &str| {
+        let v = v.trim().trim_start_matches('v');
+        let (core, pre) = v
+            .split_once('-')
+            .map_or((v, None), |(c, p)| (c, Some(p.to_string())));
+        let nums: Vec<u64> = core.split('.').map(|n| n.parse().unwrap_or(0)).collect();
+        (nums, pre)
+    };
+    let ((na, pa), (nb, pb)) = (parts(a), parts(b));
+    na.cmp(&nb).then_with(|| match (pa, pb) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => Ordering::Greater,
+        (Some(_), None) => Ordering::Less,
+        (Some(x), Some(y)) => {
+            let ids = |s: &str| s.split('.').map(String::from).collect::<Vec<_>>();
+            let (x, y) = (ids(&x), ids(&y));
+            for (i, j) in x.iter().zip(&y) {
+                let o = match (i.parse::<u64>(), j.parse::<u64>()) {
+                    (Ok(m), Ok(n)) => m.cmp(&n),
+                    (Ok(_), Err(_)) => Ordering::Less,
+                    (Err(_), Ok(_)) => Ordering::Greater,
+                    _ => i.cmp(j),
+                };
+                if o != Ordering::Equal {
+                    return o;
+                }
+            }
+            x.len().cmp(&y.len())
+        }
+    })
+}
+
 pub(crate) fn valid_name(n: &str) -> bool {
     let b = n.as_bytes();
     (2..=63).contains(&b.len())

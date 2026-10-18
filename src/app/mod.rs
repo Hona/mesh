@@ -3,12 +3,14 @@
 pub(crate) mod cp;
 pub(crate) mod exec;
 pub(crate) mod mux;
+pub(crate) mod rm;
 pub(crate) mod serve;
 mod skill;
 pub(crate) mod status;
 mod store;
 pub(crate) mod sync;
 pub(crate) mod up;
+pub(crate) mod update;
 
 pub(crate) const VERSION: &str = env!("CARGO_PKG_VERSION");
 
