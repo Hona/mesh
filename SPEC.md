@@ -701,7 +701,10 @@ Text rendering for the model:
   object)? Usually moot (desktop/login keeps it running). If it dies, add a login autostart.
 - Can `opencode api --data` / `opencode session import` read stdin? If not, large payloads go
   via `mesh cp` + a path.
-- Windows admin keys file + elevated `keys` task end to end.
+- Windows admin keys file + elevated `keys` task end to end: verified on adais (one UAC; the
+  task runs from a non-elevated `schtasks /run`). Still to see: a second device's key arriving.
+- Windows sshd drops the exit status in pty mode (plain `ssh -t` too), so `exec -t` to a
+  Windows device always exits 0. Non-`-t` exec is unaffected.
 - macOS Remote Login + full-disk-access flow (needs air online).
 - Debian VPS is not on Tailscale yet; it needs Tailscale to join.
 
