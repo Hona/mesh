@@ -147,7 +147,7 @@ state.json        # { "registry": { "kind": "github", "repo", "path", "branch" }
                   #   "device", "shell": { "name": "pwsh", "path": "<abs path>" },
                   #   "synced": "<commit sha>" }
 sync.lock         # held during a sync (pid inside; taken over if that process is gone)
-mux.sock          # Linux/macOS: the mux's local socket (dir is 0700)
+mux-<build>.sock  # Linux/macOS: the mux's local socket, one per build (dir is 0700)
 id_ed25519(.pub)  # this device's mesh key (permissions locked to the user)
 ssh_config        # generated; used via `ssh -F` for every mesh connection
 known_hosts       # generated from devices/*.host.pub
@@ -261,7 +261,10 @@ Steps (each checks first, prints ✓ / ! / ✗):
 6. **Device** — write `devices/<name>.{json,pub,host.pub}` in one commit (explicit push).
 7. **Sync** — §5.6.
 8. **MCP** — `opencode mcp add mesh --global -- <abs mesh path> mcp`. If a different `mesh`
-   MCP entry exists, ask.
+   MCP entry exists, ask. If `up` just replaced the installed binary, restart the running `mesh`
+   MCP servers so none keeps old code: `opencode api experimental.mcp.disconnect` / `connect`
+   (`server=mesh`) in every loaded location (`debug.location.list`; `opencode reload` if that
+   fails).
 9. **Schedule** — §7.2.
 10. **Self-test** — via the mesh SSH config to itself: `mesh exec self opencode --version`
     over SSH. Then `exec` a no-op on each online peer; peers that haven't synced yet are
@@ -437,7 +440,8 @@ One command updates the whole mesh:
 3. `mesh exec all mesh update --version <v>` for online devices; offline ones converge on
    their next sync (they see `pin`).
 4. On each device, reconnect the MCP server so the new binary is used
-   (`opencode api experimental.mcp.disconnect` / `connect` for `mesh`).
+   (`opencode api experimental.mcp.disconnect` / `connect` for `mesh`, in every loaded
+   location, as in §5.3 step 8).
 
 Devices never move to "latest" on their own — only to the pinned version.
 `--version` also rolls back. `--check` shows what's available.
@@ -529,16 +533,16 @@ Only `version`, `url`, `pid` are read from `service.json` — never `password`.
 Details:
 
 - The mux is the hidden `mesh mux`, spawned detached by the first client (no console, its own
-  process group, out of the caller's job when allowed; logs to `log/mux.log`). Windows pipe:
-  `\\.\pipe\opencode-mesh-<user SID>`, DACL = that user only, remote clients rejected. Unix:
-  `<state>/mux.sock`. Its hello carries a build id; a client from another build tells it to
-  quit and starts its own.
+  process group, out of the caller's job when allowed; logs to `log/mux.log`). One mux per
+  build: Windows pipe `\\.\pipe\opencode-mesh-<user SID>-<build id>`, DACL = that user only,
+  remote clients rejected; unix `<state>/mux-<build id>.sock`. Different builds (e.g. a stale
+  MCP server after an upgrade) never share or replace each other's mux; an unused one idles out.
 - The remote side is the hidden `mesh exec self --serve`; links are dialed lazily per device
   (offline devices fail at once; no hello within 15 s = failed).
 - Frame: `[kind u8][id u32 LE][len u32 LE][len bytes]`. Kinds: `0 hello` (JSON, first frame
   each way the server speaks), `1 start` (envelope JSON; to the mux it also carries `device`),
   `2 stdin` (empty = EOF), `3 stdout`, `4 stderr`, `5 exit` (JSON `{code, error?}`), `6 cancel`
-  (kill the tree), `7 quit` (client → mux), `8 ping` (echoed). Stream chunks ≤ 64 KiB. The mux
+  (kill the tree), `8 ping` (echoed). (`7` is retired.) Stream chunks ≤ 64 KiB. The mux
   rewrites ids between clients and links; a client that disconnects cancels its commands.
 - Dead links: a link quiet for 20 s is pinged before reuse (one round trip; no answer in 3 s →
   redial transparently). The mux also pings quiet links and kills one that doesn't answer
