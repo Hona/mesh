@@ -36,7 +36,7 @@ pub(crate) fn run(force: bool, keys_only: bool) -> R<SyncReport> {
     let index = pulled.as_ref().unwrap_or(&old);
     let devices = store::devices(index, &mut r.warnings);
     if !fresh {
-        device_changes(&old, index, &mut r);
+        repo_changes(&old, index, &mut r);
         client_files(&devices, &mut r)?;
     }
     keys(&devices, &mut r);
@@ -97,7 +97,10 @@ fn pull(reg: &registry::Registry, commit: &str, old: &Index, force: bool) -> Res
     Ok(index)
 }
 
-fn device_changes(old: &Index, new: &Index, r: &mut SyncReport) {
+fn repo_changes(old: &Index, new: &Index, r: &mut SyncReport) {
+    if old.contains_key("mesh.json") && old.get("mesh.json") != new.get("mesh.json") {
+        r.changes.push("~ mesh.json".into());
+    }
     let names = |i: &Index| -> BTreeSet<String> {
         i.keys()
             .filter_map(|p| p.strip_prefix("devices/")?.strip_suffix(".json"))
