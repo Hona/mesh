@@ -385,10 +385,13 @@ pub(crate) fn serve(d: &Device) -> Result<Child, String> {
         .map_err(|e| format!("ssh: {e}"))
 }
 
-/// One-shot handoff (SPEC §6.2): the envelope is the first stdin line. Caller sets stdio.
-pub(crate) fn oneshot(d: &Device) -> Result<Command, String> {
+/// One-shot handoff (SPEC §6.2): the envelope is the first stdin line, or hex in `hex` (then
+/// stdin can be null). Caller sets stdio.
+pub(crate) fn oneshot(d: &Device, hex: Option<&str>) -> Result<Command, String> {
     let mut c = ssh(d, false)?;
-    c.arg(remote_command(d, &["exec", "self", "--envelope"]));
+    let mut args = vec!["exec", "self", "--envelope"];
+    args.extend(hex);
+    c.arg(remote_command(d, &args));
     Ok(c)
 }
 

@@ -177,8 +177,17 @@ fn via_mux(
     c
 }
 
+/// Inside an SSH session on Windows (a nested `mesh exec`): ssh.exe there only relays output
+/// while its stdin pipe has data, so no mux; one-shot with the envelope in argv, stdin null.
+fn nested() -> bool {
+    cfg!(windows)
+        && (std::env::var_os("SSH_CONNECTION").is_some()
+            || std::env::var_os("SSH_CLIENT").is_some())
+}
+
 /// Fallback without a mux: one `ssh … exec self --envelope` per device.
 fn via_ssh(me: &str, devices: &[Device], env: &Envelope, input: Input, tx: Sender<Event>) {
+    let nested = nested();
     let hosts: Vec<&str> = devices.iter().map(|d| d.host.as_str()).collect();
     let peers = network::peers(&hosts).ok();
     let sinks: Arc<Mutex<Vec<Option<ChildStdin>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -200,10 +209,21 @@ fn via_ssh(me: &str, devices: &[Device], env: &Envelope, input: Input, tx: Sende
             let _ = tx.send(fail("offline".into()));
             continue;
         }
-        let spawned = ssh::oneshot(d).and_then(|mut c| {
-            c.stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+        let e = Envelope {
+            v: 1,
+            from: me.to_string(),
+            ..env.clone()
+        };
+        let mut line = serde_json::to_vec(&e).unwrap_or_default();
+        let hex = nested.then(|| serve::hex(&line));
+        let spawned = ssh::oneshot(d, hex.as_deref()).and_then(|mut c| {
+            c.stdin(if nested {
+                Stdio::null()
+            } else {
+                Stdio::piped()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
             c.spawn().map_err(|e| format!("ssh: {e}"))
         });
         let mut child = match spawned {
@@ -213,12 +233,6 @@ fn via_ssh(me: &str, devices: &[Device], env: &Envelope, input: Input, tx: Sende
                 continue;
             }
         };
-        let e = Envelope {
-            v: 1,
-            from: me.to_string(),
-            ..env.clone()
-        };
-        let mut line = serde_json::to_vec(&e).unwrap_or_default();
         line.push(b'\n');
         let mut stdin = child.stdin.take();
         if let Some(s) = stdin.as_mut() {
@@ -298,7 +312,7 @@ pub(crate) fn run(
     let n = devices.len();
     let start = Instant::now();
     let (tx, rx) = mpsc::channel();
-    let client = match mux_client() {
+    let client = match (!nested()).then(mux_client).flatten() {
         Some(c) => Some(via_mux(c, me, devices, env, input, tx)),
         None => {
             via_ssh(me, devices, env, input, tx);

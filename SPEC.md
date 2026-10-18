@@ -404,6 +404,10 @@ mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--durable] [--json] <
   is always durable.
 - A target naming a device missing from the cache runs one sync first (§5.1).
 - The remote process gets `MESH_FROM=<calling device>`.
+- Nested (`mesh exec` run inside a `mesh exec` on a Windows device): no mux, one-shot SSH per
+  device with the envelope hex-encoded in argv and stdin null. ssh.exe inside an SSH session
+  relays output only while its stdin pipe has data, so a mux started there stalls; the nested
+  command gets no stdin.
 - For long-lived background commands: `--durable` with the command's own way to background
   (`Start-Process`, `nohup … &`), or opencode's shells (`opencode api shell.create …`).
 
