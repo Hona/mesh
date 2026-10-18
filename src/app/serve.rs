@@ -5,7 +5,7 @@ use super::{VERSION, store};
 use crate::host::process::{self, Killer};
 use crate::host::{opencode, paths};
 use crate::model::{Envelope, ExitInfo};
-use crate::transport::frame::{self, CANCEL, EXIT, HELLO, START, STDERR, STDIN, STDOUT};
+use crate::transport::frame::{self, CANCEL, EXIT, HELLO, PING, START, STDERR, STDIN, STDOUT};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -238,6 +238,7 @@ pub(crate) fn serve() -> i32 {
                     r.killer.kill();
                 }
             }
+            PING => send(&out, PING, f.id, &[]),
             _ => {}
         }
     }

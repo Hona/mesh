@@ -2,7 +2,7 @@
 //! every local mesh process over the local socket. Frames from clients are routed to the
 //! device link with the ids rewritten; replies are routed back.
 
-use super::frame::{self, CANCEL, EXIT, HELLO, QUIT, START, STDERR, STDIN, STDOUT};
+use super::frame::{self, CANCEL, EXIT, HELLO, PING, QUIT, START, STDERR, STDIN, STDOUT};
 use crate::host::ipc::{self, Conn};
 use crate::model::{Envelope, ExitInfo};
 use std::collections::HashMap;
@@ -40,17 +40,44 @@ impl Peer {
     }
 }
 
+/// A link quiet for this long gets pinged before reuse (sleep/resume, network changes).
+const QUIET: Duration = Duration::from_secs(20);
+
 /// One device's persistent link.
 struct Link {
     input: Mutex<ChildStdin>,
+    child: Arc<Mutex<Child>>,
     routes: Mutex<HashMap<u32, (Arc<Peer>, u32)>>,
     next: AtomicU32,
     alive: AtomicBool,
+    last_rx: Mutex<Instant>,
+    ping_sent: Mutex<Option<Instant>>,
 }
 
 impl Link {
     fn send(&self, kind: u8, id: u32, data: &[u8]) -> io::Result<()> {
         frame::write(&mut *lock(&self.input), kind, id, data)
+    }
+
+    /// Kill the ssh process; the pump then fails the link's commands and drops it.
+    fn kill(&self) {
+        self.alive.store(false, Ordering::Relaxed);
+        let _ = lock(&self.child).kill();
+    }
+
+    /// One round trip: does the remote mesh still answer within `wait`?
+    fn ping(&self, wait: Duration) -> bool {
+        let t0 = Instant::now();
+        if self.send(PING, 0, &[]).is_err() {
+            return false;
+        }
+        while t0.elapsed() < wait {
+            if *lock(&self.last_rx) >= t0 {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        false
     }
 }
 
@@ -68,11 +95,38 @@ impl Mux {
         *lock(&self.last) = Instant::now();
     }
 
+    /// A usable link: alive, and answering a ping if it has been quiet a while.
     fn live(&self, dev: &str) -> Option<Arc<Link>> {
-        lock(&self.links)
+        let l = lock(&self.links)
             .get(dev)
             .filter(|l| l.alive.load(Ordering::Relaxed))
-            .cloned()
+            .cloned()?;
+        if lock(&l.last_rx).elapsed() < QUIET || l.ping(Duration::from_secs(3)) {
+            return Some(l);
+        }
+        eprintln!("link {dev} not answering, redialing");
+        l.kill();
+        lock(&self.links).remove(dev);
+        None
+    }
+
+    /// Ping quiet links; kill the ones that stopped answering.
+    fn watch(&self) {
+        let links: Vec<Arc<Link>> = lock(&self.links).values().cloned().collect();
+        for l in links {
+            if lock(&l.last_rx).elapsed() < QUIET {
+                continue;
+            }
+            let sent = *lock(&l.ping_sent);
+            match sent {
+                Some(t) if t.elapsed() > Duration::from_secs(10) => l.kill(),
+                Some(_) => {}
+                None => {
+                    *lock(&l.ping_sent) = Some(Instant::now());
+                    let _ = l.send(PING, 0, &[]);
+                }
+            }
+        }
     }
 
     /// The device's link, dialing it if needed (one dial at a time per device).
@@ -106,12 +160,23 @@ impl Mux {
                 v.drain(..over);
             }
         });
+        let child = Arc::new(Mutex::new(child));
+        // A connection that never says hello (stuck network, stuck remote) is given up on.
+        let hello = Arc::new(AtomicBool::new(false));
+        let (c, h) = (child.clone(), hello.clone());
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(15));
+            if !h.load(Ordering::Relaxed) {
+                let _ = lock(&c).kill();
+            }
+        });
         let mut reader = BufReader::with_capacity(frame::CHUNK, output);
         match frame::read(&mut reader) {
-            Ok(Some(f)) if f.kind == HELLO => {}
+            Ok(Some(f)) if f.kind == HELLO => hello.store(true, Ordering::Relaxed),
             _ => {
-                let _ = child.kill();
-                let _ = child.wait();
+                hello.store(true, Ordering::Relaxed);
+                let _ = lock(&child).kill();
+                let _ = lock(&child).wait();
                 let _ = drain.join();
                 let msg = String::from_utf8_lossy(&lock(&tail)).trim().to_string();
                 let msg = msg
@@ -125,26 +190,24 @@ impl Mux {
         eprintln!("link {dev} up in {} ms", started.elapsed().as_millis());
         let link = Arc::new(Link {
             input: Mutex::new(input),
+            child,
             routes: Mutex::new(HashMap::new()),
             next: AtomicU32::new(1),
             alive: AtomicBool::new(true),
+            last_rx: Mutex::new(Instant::now()),
+            ping_sent: Mutex::new(None),
         });
         lock(&self.links).insert(dev.to_string(), link.clone());
         let (mux, l, name) = (self.clone(), link.clone(), dev.to_string());
-        std::thread::spawn(move || mux.pump(&name, l, reader, child, tail));
+        std::thread::spawn(move || mux.pump(&name, l, reader, tail));
         Ok(link)
     }
 
     /// Device -> clients, until the link drops.
-    fn pump(
-        &self,
-        dev: &str,
-        link: Arc<Link>,
-        mut r: impl Read,
-        mut child: Child,
-        tail: Arc<Mutex<Vec<u8>>>,
-    ) {
+    fn pump(&self, dev: &str, link: Arc<Link>, mut r: impl Read, tail: Arc<Mutex<Vec<u8>>>) {
         while let Ok(Some(f)) = frame::read(&mut r) {
+            *lock(&link.last_rx) = Instant::now();
+            *lock(&link.ping_sent) = None;
             let route = match f.kind {
                 STDOUT | STDERR => lock(&link.routes).get(&f.id).cloned(),
                 EXIT => lock(&link.routes).remove(&f.id),
@@ -162,8 +225,8 @@ impl Mux {
                 links.remove(dev);
             }
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        let _ = lock(&link.child).kill();
+        let _ = lock(&link.child).wait();
         let why = String::from_utf8_lossy(&lock(&tail))
             .trim()
             .lines()
@@ -254,7 +317,8 @@ pub(crate) fn serve(listener: ipc::Listener, dial: Dial, idle: Duration, hello: 
     let m = mux.clone();
     std::thread::spawn(move || {
         loop {
-            std::thread::sleep(Duration::from_secs(30));
+            std::thread::sleep(Duration::from_secs(10));
+            m.watch();
             if m.clients.load(Ordering::Relaxed) == 0 && lock(&m.last).elapsed() >= idle {
                 std::process::exit(0);
             }
