@@ -48,6 +48,8 @@ pub fn run(args: Vec<String>) -> i32 {
             "-q" | "--quiet" => out.quiet = true,
             "-v" | "--verbose" => app::set_verbose(true),
             "-h" | "--help" => help = true,
+            // after a command, `--version` is that command's (`mesh update --version <v>`)
+            "--version" if cmd.is_some() => rest.push(a),
             "-V" | "--version" => {
                 println!("mesh {}", app::VERSION);
                 return 0;
