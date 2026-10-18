@@ -2,13 +2,14 @@
 //! SSH handoff (§6.2). Callers get a stream of events and render them.
 
 use super::{Fail, R, VERSION, serve, store, sync};
-use crate::host::{install, ipc, process};
+use crate::host::{install, ipc, paths, process};
 use crate::model::{Device, Envelope, ExecResult, ExitInfo, Target};
 use crate::network;
 use crate::transport::frame::{CANCEL, EXIT, START, STDERR, STDIN, STDOUT};
 use crate::transport::{mux, ssh};
 use std::io::{IsTerminal, Read, Write};
 use std::process::{ChildStdin, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -177,8 +178,29 @@ fn via_mux(
     c
 }
 
-/// Inside an SSH session on Windows (a nested `mesh exec`): ssh.exe there only relays output
-/// while its stdin pipe has data, so no mux; one-shot with the envelope in argv, stdin null.
+/// Reads a file another process writes, until `done` is set and nothing is left.
+struct Tail {
+    file: std::fs::File,
+    done: Arc<AtomicBool>,
+}
+
+impl Read for Tail {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            // checked before reading: once set, the writer has exited and one more read drains it
+            let finished = self.done.load(Ordering::Acquire);
+            let n = self.file.read(buf)?;
+            if n > 0 || finished {
+                return Ok(n);
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+}
+
+/// Inside an SSH session on Windows (a nested `mesh exec`), ssh.exe misbehaves with pipes: with
+/// a stdin pipe it relays output only while stdin has data, with a stdout pipe it never exits.
+/// So no mux; one-shot with the envelope in argv, stdin null, output through files.
 fn nested() -> bool {
     cfg!(windows)
         && (std::env::var_os("SSH_CONNECTION").is_some()
@@ -216,14 +238,26 @@ fn via_ssh(me: &str, devices: &[Device], env: &Envelope, input: Input, tx: Sende
         };
         let mut line = serde_json::to_vec(&e).unwrap_or_default();
         let hex = nested.then(|| serve::hex(&line));
+        let files = nested.then(|| {
+            let dir = paths::state_dir().join("run");
+            let _ = std::fs::create_dir_all(&dir);
+            let base = dir.join(format!("nested-{}-{i}", std::process::id()));
+            (base.with_extension("out"), base.with_extension("err"))
+        });
         let spawned = ssh::oneshot(d, hex.as_deref()).and_then(|mut c| {
-            c.stdin(if nested {
-                Stdio::null()
-            } else {
-                Stdio::piped()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            match &files {
+                Some((o, e)) => {
+                    let create = |p: &std::path::Path| {
+                        std::fs::File::create(p).map_err(|err| format!("{}: {err}", p.display()))
+                    };
+                    c.stdin(Stdio::null()).stdout(create(o)?).stderr(create(e)?);
+                }
+                None => {
+                    c.stdin(Stdio::piped())
+                        .stdout(Stdio::piped())
+                        .stderr(Stdio::piped());
+                }
+            }
             c.spawn().map_err(|e| format!("ssh: {e}"))
         });
         let mut child = match spawned {
@@ -240,22 +274,34 @@ fn via_ssh(me: &str, devices: &[Device], env: &Envelope, input: Input, tx: Sende
         }
         sinks.lock().unwrap_or_else(|e| e.into_inner()).push(stdin);
         let mut pumps = Vec::new();
-        let streams: [(Option<Box<dyn Read + Send>>, bool); 2] = [
-            (
-                child
-                    .stdout
-                    .take()
-                    .map(|s| Box::new(s) as Box<dyn Read + Send>),
-                true,
-            ),
-            (
-                child
-                    .stderr
-                    .take()
-                    .map(|s| Box::new(s) as Box<dyn Read + Send>),
-                false,
-            ),
-        ];
+        let done = Arc::new(AtomicBool::new(false));
+        let tail = |p: &std::path::Path| {
+            std::fs::File::open(p).ok().map(|file| {
+                Box::new(Tail {
+                    file,
+                    done: done.clone(),
+                }) as Box<dyn Read + Send>
+            })
+        };
+        let streams: [(Option<Box<dyn Read + Send>>, bool); 2] = match &files {
+            Some((o, e)) => [(tail(o), true), (tail(e), false)],
+            None => [
+                (
+                    child
+                        .stdout
+                        .take()
+                        .map(|s| Box::new(s) as Box<dyn Read + Send>),
+                    true,
+                ),
+                (
+                    child
+                        .stderr
+                        .take()
+                        .map(|s| Box::new(s) as Box<dyn Read + Send>),
+                    false,
+                ),
+            ],
+        };
         for (stream, is_out) in streams {
             let (Some(mut r), tx) = (stream, tx.clone()) else {
                 continue;
@@ -275,8 +321,12 @@ fn via_ssh(me: &str, devices: &[Device], env: &Envelope, input: Input, tx: Sende
         let tx = tx.clone();
         std::thread::spawn(move || {
             let st = child.wait();
+            done.store(true, Ordering::Release);
             for p in pumps {
                 let _ = p.join();
+            }
+            for f in files.iter().flat_map(|(o, e)| [o, e]) {
+                let _ = std::fs::remove_file(f);
             }
             let code = st.ok().and_then(|s| s.code()).unwrap_or(255);
             let _ = tx.send(Event::Exit(
