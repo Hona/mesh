@@ -573,14 +573,19 @@ Details:
 - The mux is the hidden `mesh mux`, spawned detached by the first client (no console, its own
   process group, out of the caller's job when allowed; logs to `log/mux.log`). One mux per
   build: Windows pipe `\\.\pipe\opencode-mesh-<user SID>-<build id>`, DACL = that user only,
-  remote clients rejected; unix `<state>/mux-<build id>.sock`. Different builds (e.g. a stale
-  MCP server after an upgrade) never share or replace each other's mux; an unused one idles out.
+  remote clients rejected; unix `<state>/mux-<build id>.sock`. Different builds never share a
+  mux. A mux exits after 10 min without clients and without command output (link pings don't
+  count); when it exits, its SSH links close and the remote `exec self --serve` processes exit
+  on EOF. A starting mux, and `up`/`update` after installing, ask this user's muxes from
+  *older* builds to quit (frame `7`; endpoints found by name prefix, incl. the pre-per-build
+  name); newer builds' muxes are never touched, so a stale old client can't knock out a new one.
 - The remote side is the hidden `mesh exec self --serve`; links are dialed lazily per device
   (offline devices fail at once; no hello within 15 s = failed).
 - Frame: `[kind u8][id u32 LE][len u32 LE][len bytes]`. Kinds: `0 hello` (JSON, first frame
   each way the server speaks), `1 start` (envelope JSON; to the mux it also carries `device`),
   `2 stdin` (empty = EOF), `3 stdout`, `4 stderr`, `5 exit` (JSON `{code, error?}`), `6 cancel`
-  (kill the tree), `7 quit` (client → mux; only `leave`), `8 ping` (echoed). Stream chunks ≤ 64 KiB. The mux
+  (kill the tree), `7 quit` (client → mux: `leave`, and newer builds retiring older muxes),
+  `8 ping` (echoed). Stream chunks ≤ 64 KiB. The mux
   rewrites ids between clients and links; a client that disconnects cancels its commands.
 - Dead links: a link quiet for 20 s is pinged before reuse (one round trip; no answer in 3 s →
   redial transparently). The mux also pings quiet links and kills one that doesn't answer
