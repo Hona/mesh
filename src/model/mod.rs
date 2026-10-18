@@ -138,9 +138,13 @@ pub(crate) struct Peer {
 
 #[derive(Serialize, Clone)]
 pub(crate) struct Opencode {
+    /// The opencode `mesh exec <device> opencode` runs (SPEC §6.4).
     pub version: Option<String>,
     pub busy: Option<u64>,
     pub service: bool,
+    /// The running service's version, only when it differs from `version`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_version: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -176,7 +180,8 @@ pub(crate) struct Status {
     pub warnings: Vec<String>,
 }
 
-#[derive(Serialize, Default)]
+#[derive(Serialize, Deserialize, Default)]
+#[serde(default)]
 pub(crate) struct SyncReport {
     pub commit: Option<String>,
     pub up_to_date: bool,

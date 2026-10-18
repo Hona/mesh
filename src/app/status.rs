@@ -40,6 +40,10 @@ fn probe_remote(me: &str, devices: &[crate::model::Device]) -> HashMap<String, P
                 version: o.get("version").and_then(|x| x.as_str()).map(String::from),
                 busy: o.get("busy").and_then(|x| x.as_u64()),
                 service: o.get("service").and_then(|x| x.as_bool()).unwrap_or(false),
+                service_version: o
+                    .get("service_version")
+                    .and_then(|x| x.as_str())
+                    .map(String::from),
             });
             let ok = r.exit == Some(0);
             let probe = Probe {

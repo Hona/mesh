@@ -135,6 +135,29 @@ pub(crate) fn ensure_task(
     r.map(|_| Outcome::Installed)
 }
 
+/// Start this user's sync job now, without waiting (it runs in the user's own logon, where the
+/// OS credential store, and so `gh`, works; an SSH session can't reach it).
+pub(crate) fn start_sync() -> Result<(), String> {
+    #[cfg(windows)]
+    let r = run(command("schtasks").args(["/run", "/tn", SYNC_TASK]));
+    #[cfg(target_os = "linux")]
+    let r = run(command("systemctl").args([
+        "--user",
+        "start",
+        "--no-block",
+        "opencode-mesh-sync.service",
+    ]));
+    #[cfg(target_os = "macos")]
+    let r = {
+        unsafe extern "C" {
+            fn getuid() -> u32;
+        }
+        let label = format!("gui/{}/opencode-mesh.sync", unsafe { getuid() });
+        run(command("launchctl").args(["kickstart", &label]))
+    };
+    r.map(drop)
+}
+
 /// Delete a task; Ok(false) if it didn't exist.
 #[cfg(windows)]
 pub(crate) fn remove_task(name: &str) -> Result<bool, String> {

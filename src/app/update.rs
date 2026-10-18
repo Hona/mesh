@@ -137,6 +137,30 @@ pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
         say("info", "releases", rel.join(" · "));
         return Ok(0);
     }
+    // Run by another device's fan-out (inside `mesh exec`): `gh` can't log in here, and the
+    // caller already pushed the pin, so this device's own sync job converges to it (§5.6 step 3).
+    if std::env::var_os("MESH_FROM").is_some() && !o.resume {
+        let rep = sync::run(false, false)?;
+        for line in rep.changes.iter().chain(&rep.applied) {
+            say("ok", "sync", line.clone());
+        }
+        for w in &rep.warnings {
+            say("warn", "sync", w.clone());
+        }
+        let now = install::installed_version().unwrap_or_else(|| "?".into());
+        if now != target {
+            return Err(Fail(
+                1,
+                format!("still mesh {now} after its sync job (pin {target})"),
+            ));
+        }
+        say(
+            "ok",
+            "binary",
+            format!("now {target} (via this device's sync job)"),
+        );
+        return Ok(0);
+    }
     if target != VERSION {
         if o.resume {
             return Err(Fail(

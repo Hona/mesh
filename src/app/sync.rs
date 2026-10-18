@@ -25,7 +25,53 @@ pub(crate) fn fetch(reg: &registry::Registry) -> Result<Option<Index>, String> {
     }
 }
 
+/// Inside `mesh exec` (an SSH session) the OS credential store, and with it `gh`'s login, is out
+/// of reach on Windows/macOS. So a remote sync runs as this device's own sync job (the user's
+/// logon) and reports that job's result.
 pub(crate) fn run(force: bool, keys_only: bool) -> R<SyncReport> {
+    if !keys_only && std::env::var_os("MESH_FROM").is_some() {
+        return via_job();
+    }
+    let r = run_here(force, keys_only);
+    if !keys_only {
+        store::write_sync_result(&r);
+    }
+    r
+}
+
+fn via_job() -> R<SyncReport> {
+    use std::time::{Duration, Instant};
+    let me = store::read_state()?.device;
+    let since = store::now_ms();
+    crate::host::schedule::start_sync()
+        .map_err(|e| Fail(1, format!("{me}: couldn't start its sync job: {e}")))?;
+    let t0 = Instant::now();
+    let mut started = false;
+    loop {
+        if let Some((_, result)) = store::read_sync_result().filter(|(at, _)| *at >= since) {
+            return result;
+        }
+        started |= store::sync_running();
+        if !started && t0.elapsed() > Duration::from_secs(20) {
+            // Windows runs the job only while the user is logged on.
+            return Err(Fail(
+                1,
+                format!(
+                    "{me}: not logged in (its sync job didn't start); it syncs on its next run"
+                ),
+            ));
+        }
+        if t0.elapsed() > Duration::from_secs(300) {
+            return Err(Fail(
+                1,
+                format!("{me}: its sync job didn't finish within 5 minutes"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn run_here(force: bool, keys_only: bool) -> R<SyncReport> {
     let mut r = SyncReport::default();
     let _lock = store::lock_sync()?;
     if keys_only {

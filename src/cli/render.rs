@@ -94,11 +94,12 @@ pub(crate) fn status_text(s: &Status) -> String {
             }
             .into(),
             oc.map_or("-".into(), |o| {
-                format!(
-                    "{}{}",
-                    o.version.as_deref().unwrap_or("?"),
-                    if o.service { "" } else { " (down)" }
-                )
+                let note = match (&o.service_version, o.service) {
+                    (Some(v), _) => format!(" (service {v})"),
+                    (None, true) => String::new(),
+                    (None, false) => " (down)".into(),
+                };
+                format!("{}{note}", o.version.as_deref().unwrap_or("?"))
             }),
             oc.and_then(|o| o.busy)
                 .map_or("-".into(), |b| b.to_string()),

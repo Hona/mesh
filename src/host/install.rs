@@ -51,6 +51,16 @@ pub(crate) fn clean_old() {
     }
 }
 
+/// Version of the installed mesh (`mesh -V`).
+pub(crate) fn installed_version() -> Option<String> {
+    let out = super::process::command(dir().join(names()[0]))
+        .arg("-V")
+        .output()
+        .ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    Some(s.split_whitespace().nth(1)?.to_string())
+}
+
 /// The installed mesh, if it is the same build as the running one (the mux runs from there so
 /// it never locks a build output or download folder).
 pub(crate) fn installed_copy() -> Option<PathBuf> {

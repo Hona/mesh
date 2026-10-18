@@ -25,6 +25,8 @@ MCP tools `mesh_status` and `mesh_exec` are the same commands with JSON output.
 
 Exit codes: the remote command's own code · 255 = device unreachable. Offline devices are skipped.
 
+On Windows and macOS devices, tools that keep their login in the OS credential store (like `gh`) may not be logged in inside `mesh exec`.
+
 Don't send work back to the device that sent it to you (`MESH_FROM` is set on remote commands).
 
 ## Examples

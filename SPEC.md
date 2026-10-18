@@ -147,6 +147,7 @@ state.json        # { "registry": { "kind": "github", "repo", "path", "branch" }
                   #   "device", "shell": { "name": "pwsh", "path": "<abs path>" },
                   #   "synced": "<commit sha>" }
 sync.lock         # held during a sync (pid inside; taken over if that process is gone)
+sync.result       # how the last sync ended (report or error), for a remote `mesh sync` (§5.6)
 mux-<build>.sock  # Linux/macOS: the mux's local socket, one per build (dir is 0700)
 id_ed25519(.pub)  # this device's mesh key (permissions locked to the user)
 ssh_config        # generated; used via `ssh -F` for every mesh connection
@@ -322,6 +323,10 @@ air      macos    zsh         no      -         -     -
 Also shows: pending binary updates (`0.1.0 → 0.2.0 (pending)`), a customised mesh skill,
 local `AGENTS.md` edits that were backed up, last sync time/commit.
 
+OPENCODE is the version of the opencode `mesh exec <device> opencode` would run (§6.4). If the
+running service is a different version it is appended, `2.0.28 (service 0.0.0-beta-21153)`
+(JSON: `opencode.service_version`, present only then); `(down)` when no service runs.
+
 ### 5.5 `mesh exec`
 
 Run a command on devices.
@@ -399,6 +404,13 @@ Pull-only. Never writes to the repo.
 Prints a short diff (`+ device air`, `~ skill review`, …). Runs on schedule and lazily when a
 target names an unknown device.
 
+Inside `mesh exec` (an SSH session, `MESH_FROM` set) the OS credential store, and so `gh`'s
+login, is out of reach on Windows and macOS (Linux: no secret service). There, `sync` starts the
+device's own sync job (`\opencode-mesh\sync` task, `launchctl kickstart`, `systemctl --user
+start`), waits for its `sync.result` (up to 5 min) and reports that. A job that doesn't start
+within 20 s means the user isn't logged on (Windows runs it only then): it fails with
+`<device>: not logged in …; it syncs on its next run`. `--force` doesn't carry over.
+
 ### 5.7 `mesh cp`
 
 ```
@@ -459,8 +471,11 @@ is the highest release, counting prereleases only when this build is one.
 - Step 1 downloads `mesh-<os>-<arch>[.exe]` (+ `meshw-…` on Windows) and `SHA256SUMS` into
   `<state>/update/`, then swaps them in at the §4.4 install path. Steps 2–4 run in the new
   binary (`mesh update --version <v> --resume`), so the skill it pushes is the new one.
-- Run on a device by another device's step 3 (`MESH_FROM` is set), `update` does steps 1 and 4
-  only: no repo writes, no further fan-out.
+- Run on a device by another device's step 3 (`MESH_FROM` is set), `update` downloads nothing
+  itself (`gh` can't log in there, §5.6): the caller already pushed the pin, so it runs the
+  device's own sync job, which converges to it (§5.6 step 3, incl. the MCP restart), and
+  reports the new version. No repo writes, no further fan-out. Devices on 0.1.0-dev.5 or older
+  don't have this and need their own sync job to run once (≤ interval).
 - Pin and skill go in one commit; nothing is committed when both are already current.
 `mesh update` and the exec handoff stay backward compatible, so a new binary can always tell
 an old one to update.
@@ -526,8 +541,13 @@ with spaces it's double-quoted (cmd, the default). Unix: single-quoted.
 2. `~/.local/state/opencode/service.json` (respect `XDG_STATE_HOME`) → `pid` → that process's
    executable path (the one persistent service; e.g.
    `%APPDATA%\ai.opencode.desktop\cli\2.0.32-x64\opencode-cli.exe serve --service`).
-3. Known install locations (e.g. newest version dir under the desktop app's `cli\`, the
-   desktop app's bundled `resources\opencode-cli.exe`).
+3. Known install locations: the desktop apps' CLIs, stable and beta (`%APPDATA%\ai.opencode.desktop\cli\<v>\`,
+   `%APPDATA%\ai.opencode.desktop.beta\cli\<v>\`, the bundled
+   `%LOCALAPPDATA%\Programs\@opencodedesktop\resources\opencode-cli.exe`; the same app ids
+   under `~/Library/Application Support/` or `~/.local/share/`, and `/Applications/OpenCode
+   [Beta].app` on macOS), taking the most recently installed one (beta versions
+   `0.0.0-beta-N` sort below stable ones), then `~/.opencode/bin/opencode` and the usual bin
+   dirs.
 
 Only `version`, `url`, `pid` are read from `service.json` — never `password`.
 

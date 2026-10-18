@@ -1,4 +1,4 @@
-//! Finding and asking the local opencode install (SPEC Â§6.4).
+//! Finding and asking the local opencode install (SPEC §6.4).
 
 use super::{paths, process, vlog};
 use crate::model::Opencode;
@@ -60,45 +60,44 @@ fn known() -> Vec<PathBuf> {
     } else {
         "opencode-cli"
     };
-    let mut v = Vec::new();
-    // Desktop app: newest versioned CLI dir, e.g. cli\2.0.32-x64\opencode-cli.exe
-    if let Ok(rd) = std::fs::read_dir(
-        paths::app_data_dir()
-            .join("ai.opencode.desktop")
-            .join("cli"),
-    ) {
-        let newest = rd
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.join(cli).is_file())
-            .max_by_key(|p| version_key(p));
-        v.extend(newest.map(|d| d.join(cli)));
-    }
+    // Desktop apps (stable and beta): each versioned CLI dir, e.g.
+    // ai.opencode.desktop.beta\cli\0.0.0-beta-21153-x64\opencode-cli.exe, and the bundled copies.
+    let mut desktop: Vec<PathBuf> = ["ai.opencode.desktop", "ai.opencode.desktop.beta"]
+        .iter()
+        .flat_map(|app| {
+            std::fs::read_dir(paths::app_data_dir().join(app).join("cli"))
+                .into_iter()
+                .flatten()
+        })
+        .flatten()
+        .map(|e| e.path().join(cli))
+        .collect();
     if cfg!(windows) {
-        v.extend(
+        desktop.extend(
             paths::env_dir("LOCALAPPDATA")
                 .map(|l| l.join(r"Programs\@opencodedesktop\resources").join(cli)),
         );
+    } else if cfg!(target_os = "macos") {
+        for app in ["OpenCode", "OpenCode Beta"] {
+            desktop
+                .push(PathBuf::from(format!("/Applications/{app}.app/Contents/MacOS")).join(cli));
+        }
+    }
+    // Beta versions (0.0.0-beta-N) sort below stable ones, so "newest" = most recently installed.
+    let modified = |p: &PathBuf| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    let mut v: Vec<PathBuf> = desktop
+        .into_iter()
+        .filter(|p| p.is_file())
+        .max_by_key(modified)
+        .into_iter()
+        .collect();
+    if cfg!(windows) {
         v.push(home.join(r".opencode\bin\opencode.exe"));
     } else {
-        if cfg!(target_os = "macos") {
-            v.push(PathBuf::from("/Applications/OpenCode.app/Contents/MacOS").join(cli));
-        }
         v.push(home.join(".opencode/bin/opencode"));
         v.extend(paths::unix_bin_dirs("opencode"));
     }
     v
-}
-
-/// "2.0.32-x64" -> [2, 0, 32]
-fn version_key(p: &Path) -> Vec<u64> {
-    let name = p.file_name().unwrap_or_default().to_string_lossy();
-    name.split('-')
-        .next()
-        .unwrap_or("")
-        .split('.')
-        .map(|s| s.parse().unwrap_or(0))
-        .collect()
 }
 
 fn version(bin: &Path) -> Option<String> {
@@ -128,31 +127,44 @@ fn busy(bin: &Path) -> Option<u64> {
     }
 }
 
-/// Local opencode facts; None if opencode isn't installed. Never starts the
-/// service: version comes from service.json and busy is only asked of a running one.
+/// Local opencode facts; None if opencode isn't installed. `version` is the opencode that
+/// `mesh exec … opencode` runs (§6.4); the running service's version is added only when it
+/// differs. Never starts the service: busy is only asked of a running one.
 pub(crate) fn probe() -> Option<Opencode> {
     let svc = service();
     let (bin, how) = find(svc.as_ref())?;
     vlog!("opencode: {} ({how})", bin.display());
-    match svc {
-        Some(Service {
-            exe: Some(_),
-            version: v,
-            ..
-        }) => Some(Opencode {
-            version: v.or_else(|| version(&bin)),
-            busy: busy(&bin),
-            service: true,
-        }),
-        _ => Some(Opencode {
-            version: version(&bin),
-            busy: None,
-            service: false,
-        }),
-    }
+    let running = svc
+        .as_ref()
+        .and_then(|s| s.exe.as_ref().map(|exe| (exe.clone(), s.version.clone())));
+    let up = running.is_some();
+    // exec runs the service's own binary: service.json already has its version, no spawn
+    let known = running
+        .as_ref()
+        .filter(|(exe, _)| *exe == bin)
+        .and_then(|(_, v)| v.clone());
+    let (exec_version, busy) = std::thread::scope(|s| {
+        let v = known.is_none().then(|| s.spawn(|| version(&bin)));
+        let b = up.then(|| busy(&bin)).flatten();
+        (
+            known
+                .clone()
+                .or_else(|| v.and_then(|h| h.join().ok().flatten())),
+            b,
+        )
+    });
+    let service_version = running
+        .and_then(|(_, v)| v)
+        .filter(|v| Some(v) != exec_version.as_ref());
+    Some(Opencode {
+        version: exec_version,
+        busy,
+        service: up,
+        service_version,
+    })
 }
 
-/// The opencode binary `mesh exec <device> opencode â€¦` runs (Â§6.4).
+/// The opencode binary `mesh exec <device> opencode …` runs (§6.4).
 pub(crate) fn bin() -> Option<PathBuf> {
     find(service().as_ref()).map(|(p, _)| p)
 }
