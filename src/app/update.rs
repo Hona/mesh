@@ -192,6 +192,8 @@ pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
     if std::env::var_os("MESH_FROM").is_none() {
         publish(&state, &target, &say)?;
         failed = fan_out(&state.device, &target, &say);
+        // The fan-out's links run the devices' pre-update mesh; the next command redials.
+        exec::stop_mux();
     }
     // Only a swapped binary needs the MCP server restarted.
     if o.resume {

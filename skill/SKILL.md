@@ -35,7 +35,7 @@ Use `--durable` (MCP `durable: true`) when what the command starts must keep run
 
 ## Recovery
 
-`mesh status` OPENCODE: `(service down)` not running · `(service stale)` crashed (service.json names a dead pid) · `(service hung)` running, not answering. The `mesh` CLI doesn't need opencode: fix a broken device from another one.
+`mesh status` OPENCODE: `(service down)` not running · `(service stale)` crashed (service.json names a dead pid) · `(service hung)` running, not answering for 4 s (a busy service can miss once: check twice). The `mesh` CLI doesn't need opencode: fix a broken device from another one.
 
     mesh exec blade opencode service start              # down / stale (start|restart are durable automatically)
     mesh exec --timeout 20 blade opencode service stop  # hung; if that times out, kill the pid, then start:

@@ -364,6 +364,11 @@ every opencode spawn mesh makes (version, busy, config, reload, MCP restarts) ha
 (3 s for status probes, 20 s otherwise) and is skipped when the service doesn't answer.
 Older devices send `service: true|false` (read as `ok` / `down`).
 
+A running desktop app owns its service and starts it again by itself (verified on Blade): within
+~1 s after `opencode service stop`, a little later after a kill; `opencode service start` then
+adopts whichever registers first. `hung` can show once while a busy service catches up (seen
+for a few seconds right after MCP restarts).
+
 ### 5.5 `mesh exec`
 
 Run a command on devices.
@@ -515,7 +520,8 @@ One command updates the whole mesh:
    `mesh.exe`/`meshw.exe` to `*.old`, write new, delete `*.old` on a later run).
 2. Set `pin` in `mesh.json` and push (explicit). Push `skills/mesh/SKILL.md` if newer (§9).
 3. `mesh exec all mesh update --version <v>` for online devices; offline ones converge on
-   their next sync (they see `pin`).
+   their next sync (they see `pin`). Then the local mux is told to quit: its links still run
+   the devices' pre-update mesh, so the next command redials.
 4. On each device, reconnect the MCP server so the new binary is used
    (`opencode api experimental.mcp.disconnect` / `connect` for `mesh`, in every loaded
    location, as in §5.3 step 8).
