@@ -164,6 +164,50 @@ pub(crate) fn probe() -> Option<Opencode> {
     })
 }
 
+/// Started by opencode (an agent's shell, a terminal in the app, an MCP server): opencode puts
+/// `OPENCODE=1` in the environment of everything it starts.
+pub(crate) fn inside() -> bool {
+    std::env::var_os("OPENCODE").is_some() || std::env::var_os("OPENCODE_SESSION_ID").is_some()
+}
+
+/// `opencode service restart` (the service's own binary, so the desktop app accepts the new one)
+/// with `dir` added to PATH: the new service, and the shells and MCP servers it starts, inherit
+/// it. Refused while any session runs. Ok(false): no service is running, nothing to restart.
+pub(crate) fn restart_service(dir: &Path) -> Result<bool, String> {
+    let Some(Service {
+        exe: Some(bin),
+        pid: old,
+        ..
+    }) = service()
+    else {
+        return Ok(false);
+    };
+    match busy(&bin) {
+        Some(0) => {}
+        Some(n) => return Err(format!("{n} session(s) running")),
+        None => return Err("can't tell whether sessions are running".into()),
+    }
+    let cur = std::env::var_os("PATH").unwrap_or_default();
+    let mut path: Vec<PathBuf> = std::env::split_paths(&cur).collect();
+    if !path.iter().any(|p| p == dir) {
+        path.push(dir.to_path_buf());
+    }
+    let path = std::env::join_paths(path).map_err(|e| e.to_string())?;
+    // No pipes: the new service could inherit them and keep this call from ever returning.
+    let st = process::command(&bin)
+        .args(["service", "restart"])
+        .env("PATH", path)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| e.to_string())?;
+    match service() {
+        Some(s) if s.exe.is_some() && s.pid != old => Ok(true),
+        _ => Err(format!("`opencode service restart` failed ({st})")),
+    }
+}
+
 /// The opencode binary `mesh exec <device> opencode …` runs (§6.4).
 pub(crate) fn bin() -> Option<PathBuf> {
     find(service().as_ref()).map(|(p, _)| p)

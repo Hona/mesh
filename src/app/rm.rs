@@ -179,6 +179,13 @@ pub(crate) fn leave(
         "`Include` line removed from ~/.ssh/config",
         "no `Include` line",
     );
+    #[cfg(unix)]
+    report(
+        "PATH",
+        install::remove_profile_line(),
+        "mesh's PATH line removed from the shell profile",
+        "no mesh PATH line in shell profiles",
+    );
 
     // 4. last: this build's mux, then the state dir (key, cache, logs)
     exec::stop_mux();

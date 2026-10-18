@@ -3,8 +3,8 @@
 #   gh api repos/Hona/mesh/contents/install.sh -H "Accept: application/vnd.github.raw" | sh
 #   ... | sh -s -- --yes            (arguments go to `mesh up`)
 #   ... | MESH_VERSION=0.1.0 sh     (a release; default: the latest)
-# Downloads with gh, checks SHA256SUMS, then `mesh up` installs to ~/.local/bin and sets this
-# device up.
+# Downloads with gh, checks SHA256SUMS, then `mesh up` installs to ~/.local/bin (adding it to
+# PATH in the shell profile if needed) and sets this device up.
 set -eu
 case "$(uname -s)" in
   Linux) os=linux ;;

@@ -54,12 +54,17 @@ fn initialize(params: &Value) -> Value {
         .iter()
         .map(|d| format!("{} ({})", d.name, d.os))
         .collect();
+    // The absolute CLI path: right after a first install, opencode's shells don't have the new
+    // PATH yet, but this server was just (re)started by `mesh up`.
+    let cli = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "mesh".into());
     json!({
         "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
         "capabilities": { "tools": {} },
         "serverInfo": { "name": "mesh", "version": VERSION },
         "instructions": format!(
-            "Opencode mesh: devices {}. Load the \"mesh\" skill before using mesh tools.",
+            "Opencode mesh: devices {}. Load the \"mesh\" skill before using mesh tools. CLI: {cli}",
             devices.join(", ")
         ),
     })

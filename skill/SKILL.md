@@ -23,6 +23,8 @@ Targets: `name` · `a,b` · `all` (includes this device) · `self` · `os:linux|
 
 MCP tools `mesh_status` and `mesh_exec` are the same commands with JSON output.
 
+If `mesh` isn't on PATH, use the CLI path from the mesh MCP instructions.
+
 Exit codes: the remote command's own code · 255 = device unreachable. Offline devices are skipped.
 
 On Windows and macOS devices, tools that keep their login in the OS credential store (like `gh`) may not be logged in inside `mesh exec`.

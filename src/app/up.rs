@@ -5,7 +5,7 @@ use super::exec::{self, Input};
 use super::store::{self, Index};
 use super::{Fail, R, serve, skill, sync};
 use crate::host::install::{self, Installed};
-use crate::host::{opencode, paths, process, schedule};
+use crate::host::{opencode, paths, process, schedule, vlog};
 use crate::model::{Device, Envelope, RegistryConfig, Shell, State, Step, valid_name};
 use crate::transport::ssh;
 use crate::{network, registry};
@@ -164,6 +164,37 @@ impl Up<'_> {
             done.into()
         }
     }
+
+    /// A new PATH reaches agents' shells only through a restarted opencode service (SPEC §5.3
+    /// step 12), done here only when it can't cut anything off.
+    fn path_live(&self) {
+        const HINT: &str = "restart opencode (or the desktop app) so agents can run plain `mesh`";
+        if self.o.check {
+            return self.info(
+                "PATH",
+                "would restart the opencode service if no session is running",
+            );
+        }
+        // Windows: a service started from an SSH session is killed when the session ends.
+        let ssh = cfg!(windows)
+            && (std::env::var_os("SSH_CONNECTION").is_some()
+                || std::env::var_os("MESH_FROM").is_some());
+        if opencode::inside() || ssh {
+            vlog!("PATH: no restart: run from inside opencode or an SSH session");
+            return self.warn("PATH", HINT);
+        }
+        match opencode::restart_service(&install::dir()) {
+            Ok(true) => self.ok(
+                "PATH",
+                "restarted the opencode service: agents can run plain `mesh`",
+            ),
+            Ok(false) => vlog!("PATH: no opencode service running, nothing to restart"),
+            Err(e) => {
+                vlog!("PATH: no restart: {e}");
+                self.warn("PATH", HINT);
+            }
+        }
+    }
 }
 
 fn user() -> String {
@@ -226,21 +257,12 @@ pub(crate) fn run(o: &Opts, ui: &Ui) -> R<i32> {
     } else {
         String::new()
     };
-    if path_added && cfg!(windows) {
+    if let Some(w) = &path_added {
         note += up
-            .would(" · added to user PATH", " · would add to user PATH")
+            .would(&format!(" · added to {w}"), &format!(" · would add to {w}"))
             .as_str();
     }
     up.ok("install", format!("{}{note}", inst.mesh.display()));
-    if path_added && cfg!(unix) {
-        up.warn(
-            "install",
-            format!(
-                "{} isn't on PATH; add it in your shell profile",
-                install::dir().display()
-            ),
-        );
-    }
     up.ok("gh", format!("logged in as {login}"));
     let pid = oc_pid
         .map(|p| format!("  (service pid {p})"))
@@ -409,6 +431,9 @@ pub(crate) fn run(o: &Opts, ui: &Ui) -> R<i32> {
         up.self_test(&name);
     }
     up.include();
+    if path_added.is_some() {
+        up.path_live();
+    }
     Ok(if up.failed { 1 } else { 0 })
 }
 

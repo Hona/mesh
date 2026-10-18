@@ -157,8 +157,9 @@ backup/<time>/    # backups of anything mesh replaced (AGENTS.md, conflicting sk
 log/              # background run logs
 ```
 
-Installed binary: `~/.local/bin/mesh` (Linux/macOS);
-`%LOCALAPPDATA%\Programs\mesh\{mesh,meshw}.exe` (Windows, added to user PATH).
+Installed binary: `~/.local/bin/mesh` (Linux/macOS; if that isn't on PATH, one marked line in the
+`$SHELL` profile adds it, §5.3); `%LOCALAPPDATA%\Programs\mesh\{mesh,meshw}.exe` (Windows, added
+to user PATH).
 Everything internal (MCP registration, remote handoff, scheduled tasks) uses absolute paths.
 
 ### 4.5 Architecture (`src/`)
@@ -274,6 +275,18 @@ Steps (each checks first, prints ✓ / ! / ✗):
 11. **Opt-in extra** — offer to add one `Include <state>/ssh_config` line to `~/.ssh/config`
     so plain `ssh <device>` works. Skipped if any mesh device name clashes with an existing
     `Host` entry.
+12. **PATH live** — only if step 1 added the install dir to PATH (Windows: user PATH;
+    Linux/macOS: when `~/.local/bin` isn't on PATH, one line ending `# opencode-mesh: PATH` in
+    the `$SHELL` profile: `~/.zshrc`, `~/.bashrc` (macOS `~/.bash_profile`),
+    `~/.config/fish/conf.d/opencode-mesh.fish`, else `~/.profile`). The running opencode
+    service, its agents' shells and the MCP servers it starts keep the old PATH, so `up` runs
+    `opencode service restart` (the service's own binary, with the install dir added to PATH)
+    when that cuts nothing off: `up` isn't running inside opencode (`OPENCODE` /
+    `OPENCODE_SESSION_ID` unset; opencode sets them for everything it starts), not in an SSH
+    session on Windows (the new service would die with it), and `session.active` is empty.
+    The restart closes opencode's own terminals, like any service restart. Otherwise:
+    `! PATH  restart opencode (or the desktop app) so agents can run plain \`mesh\``. Until
+    then agents use the CLI path in the MCP `instructions` (§8).
 
 Example:
 
@@ -436,7 +449,8 @@ mesh leave [--yes]           # this device
 
 `leave`: delete own `devices/*` (commit), then undo all local setup — MCP registration
 (`opencode api experimental.mcp.remove`), scheduled tasks, the managed keys block, the
-opt-in `Include` line, `skills/opencode-mesh/`, the state dir (incl. key). Leaves
+opt-in `Include` line, the marked PATH line in shell profiles (Linux/macOS),
+`skills/opencode-mesh/`, the state dir (incl. key). Leaves
 `~/.config/opencode/AGENTS.md`, an installed SSH server and the mesh binaries in place.
 
 - `experimental.mcp.remove` only drops the running server, and the config API can't delete
@@ -667,8 +681,11 @@ ssh-ed25519 AAAA… opencode-mesh:air
 - Tool results: `content` (readable text for the model) + `structuredContent` (same JSON as
   the CLI's `--json`). `isError` only for mesh-level errors (bad arguments); per-device
   failures live in `results`.
-- `instructions` (one line, from the local cache):
-  `Opencode mesh: devices adais (windows), blade (windows), air (macos). Load the "mesh" skill before using mesh tools.`
+- `instructions` (one line, from the local cache, plus the server's own absolute path, which
+  works before a new PATH reaches opencode's shells; `up` restarts the server, so it's there at
+  once):
+  `Opencode mesh: devices adais (windows), blade (windows), air (macos). Load the "mesh" skill before using mesh tools. CLI: C:\Users\Lukem\AppData\Local\Programs\mesh\mesh.exe`
+- The built-in skill says: if `mesh` isn't on PATH, use that CLI path.
 
 ### 8.1 `status`
 
@@ -734,7 +751,8 @@ Text rendering for the model:
   `gh api repos/Hona/mesh/contents/install.ps1 -H "Accept: application/vnd.github.raw" | Out-String | iex`
 - Both download via `gh release download` (latest, or `MESH_VERSION=<x.y.z>`), check
   `SHA256SUMS`, then run `mesh up` from the download folder; `up` installs to the paths in §4.4
-  (rename-aside if in use), adds the user PATH and restarts the MCP server. Arguments for `up`:
+  (rename-aside if in use), puts it on PATH (user PATH / shell profile line), restarts the MCP
+  server, and restarts the opencode service when safe (§5.3 step 12). Arguments for `up`:
   `| sh -s -- <args>` / `$env:MESH_UP_ARGS`.
 - Copy-paste prompt (any OS):
   > Install opencode mesh on this device: use `gh release download` to get the `mesh` binary

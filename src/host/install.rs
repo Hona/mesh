@@ -146,16 +146,16 @@ fn expand(s: &str) -> String {
     out
 }
 
-/// Add `dir` to the user PATH (HKCU\Environment). Ok(true) if it was (or would be) added.
+/// Add `dir` to the user PATH (HKCU\Environment). Some(where) if it was (or would be) added.
 #[cfg(windows)]
-pub(crate) fn ensure_user_path(dir: &Path, check: bool) -> Result<bool, String> {
+pub(crate) fn ensure_user_path(dir: &Path, check: bool) -> Result<Option<String>, String> {
     use super::win;
     let (ty, cur) = win::reg_get(win::HKCU, "Environment", "Path")
         .unwrap_or((win::REG_EXPAND_SZ, String::new()));
     let want = dir.display().to_string();
     let norm = |p: &str| expand(p).trim_end_matches('\\').to_lowercase();
     if cur.split(';').any(|p| norm(p) == want.to_lowercase()) {
-        return Ok(false);
+        return Ok(None);
     }
     if !check {
         let new = if cur.trim().is_empty() {
@@ -168,12 +168,89 @@ pub(crate) fn ensure_user_path(dir: &Path, check: bool) -> Result<bool, String> 
         }
         win::broadcast_env_change();
     }
-    Ok(true)
+    Ok(Some("user PATH".into()))
 }
 
-/// Unix: mesh never edits shell profiles; Ok(true) means "not on PATH yet".
+/// Ends mesh's one line in a shell profile; `mesh leave` removes lines ending with it.
 #[cfg(unix)]
-pub(crate) fn ensure_user_path(dir: &Path, _check: bool) -> Result<bool, String> {
+const MARK: &str = "# opencode-mesh: PATH";
+
+/// The profile of the user's shell (`$SHELL`) and the marked line putting `dir` on PATH there.
+#[cfg(unix)]
+fn profile(dir: &Path) -> (PathBuf, String) {
+    let home = paths::home();
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let d = dir.display();
+    let export = format!("export PATH=\"{d}:$PATH\" {MARK}");
+    match shell.rsplit('/').next().unwrap_or("") {
+        "zsh" => (home.join(".zshrc"), export),
+        // macOS terminals start login shells
+        "bash" if cfg!(target_os = "macos") => (home.join(".bash_profile"), export),
+        "bash" => (home.join(".bashrc"), export),
+        "fish" => (
+            home.join(".config/fish/conf.d/opencode-mesh.fish"),
+            format!("fish_add_path -g \"{d}\" {MARK}"),
+        ),
+        _ => (home.join(".profile"), export),
+    }
+}
+
+/// If `dir` isn't on PATH, add one marked line to the shell profile. Some(where) if it was (or
+/// would be) added; None if PATH has it or the line is already there.
+#[cfg(unix)]
+pub(crate) fn ensure_user_path(dir: &Path, check: bool) -> Result<Option<String>, String> {
     let path = std::env::var_os("PATH").unwrap_or_default();
-    Ok(!std::env::split_paths(&path).any(|p| p == dir))
+    if std::env::split_paths(&path).any(|p| p == dir) {
+        return Ok(None);
+    }
+    let (file, line) = profile(dir);
+    let text = fs::read_to_string(&file).unwrap_or_default();
+    if text.lines().any(|l| l.trim_end().ends_with(MARK)) {
+        return Ok(None);
+    }
+    if !check {
+        if let Some(parent) = file.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        let sep = if text.is_empty() || text.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        fs::write(&file, format!("{text}{sep}{line}\n"))
+            .map_err(|e| format!("{}: {e}", file.display()))?;
+    }
+    let home = paths::home();
+    let shown = file.strip_prefix(&home).map_or_else(
+        |_| file.display().to_string(),
+        |rel| format!("~/{}", rel.display()),
+    );
+    Ok(Some(shown))
+}
+
+/// `mesh leave`: drop the marked line from every profile `ensure_user_path` may have used
+/// (`$SHELL` may have changed since); every other byte stays. Ok(true) if one was there.
+#[cfg(unix)]
+pub(crate) fn remove_profile_line() -> Result<bool, String> {
+    let home = paths::home();
+    let mut removed = false;
+    for name in [".zshrc", ".bashrc", ".bash_profile", ".profile"] {
+        let file = home.join(name);
+        let Ok(text) = fs::read_to_string(&file) else {
+            continue;
+        };
+        let ours = |l: &str| l.trim_end().ends_with(MARK);
+        if !text.lines().any(ours) {
+            continue;
+        }
+        let kept: String = text.split_inclusive('\n').filter(|l| !ours(l)).collect();
+        fs::write(&file, kept).map_err(|e| format!("{}: {e}", file.display()))?;
+        removed = true;
+    }
+    let fish = home.join(".config/fish/conf.d/opencode-mesh.fish");
+    if fish.is_file() {
+        fs::remove_file(&fish).map_err(|e| format!("{}: {e}", fish.display()))?;
+        removed = true;
+    }
+    Ok(removed)
 }
