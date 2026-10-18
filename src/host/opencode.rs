@@ -77,18 +77,38 @@ fn state(svc: Option<&Service>) -> ServiceState {
     }
 }
 
-/// PATH, then the running service's executable, then known install locations.
+/// Where the last live service's executable is remembered (§6.4 step 2).
+fn last_service_file() -> PathBuf {
+    paths::state_dir().join("opencode-service")
+}
+
+/// The running service's executable, then the last one seen, then PATH, then known install
+/// locations. Every opencode CLI is a client of the one background service, and another
+/// version can replace it with an incompatible one (seen: an old PATH CLI's `service restart`
+/// left a service answering 500), so the service's own build comes first.
 fn find(svc: Option<&Service>) -> Option<(PathBuf, String)> {
-    if let Some(p) = paths::on_path("opencode") {
-        return Some((p, "PATH".into()));
-    }
     if let Some(Service {
         exe: Some(exe),
         pid,
         ..
     }) = svc
     {
+        let f = last_service_file();
+        let text = exe.display().to_string();
+        if std::fs::read_to_string(&f).ok().as_deref() != Some(text.as_str()) {
+            let _ = std::fs::write(&f, &text);
+        }
         return Some((exe.clone(), format!("service pid {pid}")));
+    }
+    if let Some(p) = std::fs::read_to_string(last_service_file())
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+    {
+        return Some((p, "last service".into()));
+    }
+    if let Some(p) = paths::on_path("opencode") {
+        return Some((p, "PATH".into()));
     }
     known()
         .into_iter()

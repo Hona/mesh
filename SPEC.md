@@ -588,11 +588,16 @@ with spaces it's double-quoted (cmd, the default). Unix: single-quoted.
 
 ### 6.4 Finding opencode on a device (at run time, on that device)
 
-1. `opencode` on PATH.
-2. `~/.local/state/opencode/service.json` (respect `XDG_STATE_HOME`) → `pid` → that process's
+1. `~/.local/state/opencode/service.json` (respect `XDG_STATE_HOME`) → `pid` → that process's
    executable path (the one persistent service; e.g.
-   `%APPDATA%\ai.opencode.desktop\cli\2.0.32-x64\opencode-cli.exe serve --service`).
-3. Known install locations: the desktop apps' CLIs, stable and beta (`%APPDATA%\ai.opencode.desktop\cli\<v>\`,
+   `%APPDATA%\ai.opencode.desktop\cli\2.0.32-x64\opencode-cli.exe serve --service`). Every
+   opencode CLI is a client of that service, and another version can replace it with an
+   incompatible one (seen on Blade: PATH's 2.0.28 `service restart` replaced the desktop's
+   beta service with one answering 500), so the service's own build comes first.
+2. The last service executable seen by step 1 (`<state>/opencode-service`), so a down or stale
+   service is started again with the same build.
+3. `opencode` on PATH.
+4. Known install locations: the desktop apps' CLIs, stable and beta (`%APPDATA%\ai.opencode.desktop\cli\<v>\`,
    `%APPDATA%\ai.opencode.desktop.beta\cli\<v>\`, the bundled
    `%LOCALAPPDATA%\Programs\@opencodedesktop\resources\opencode-cli.exe`; the same app ids
    under `~/Library/Application Support/` or `~/.local/share/`, and `/Applications/OpenCode
