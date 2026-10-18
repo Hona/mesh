@@ -282,10 +282,13 @@ Steps (each checks first, prints ✓ / ! / ✗):
     `~/.config/fish/conf.d/opencode-mesh.fish`, else `~/.profile`). The running opencode
     service, its agents' shells and the MCP servers it starts keep the old PATH, so `up` runs
     `opencode service restart` (the service's own binary, with the install dir added to PATH)
-    when that cuts nothing off: `up` isn't running inside opencode (`OPENCODE` /
+    when that cuts nothing off and can work: `up` isn't running inside opencode (`OPENCODE` /
     `OPENCODE_SESSION_ID` unset; opencode sets them for everything it starts), not in an SSH
-    session on Windows (the new service would die with it), and `session.active` is empty.
-    The restart closes opencode's own terminals, like any service restart. Otherwise:
+    session on Windows (the new service would die with it), `session.active` is empty, and no
+    live opencode client owns the service (its parent process is the desktop app or a TUI:
+    that client starts the replacement itself, from its own old environment). After the
+    restart, a replacement started by a live client also counts as not done. The restart
+    closes opencode's own terminals, like any service restart. Otherwise:
     `! PATH  restart opencode (or the desktop app) so agents can run plain \`mesh\``. Until
     then agents use the CLI path in the MCP `instructions` (§8).
 

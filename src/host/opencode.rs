@@ -170,9 +170,19 @@ pub(crate) fn inside() -> bool {
     std::env::var_os("OPENCODE").is_some() || std::env::var_os("OPENCODE_SESSION_ID").is_some()
 }
 
+/// The live opencode client (desktop app, TUI) that started process `pid`, if any. Such a client
+/// starts the service again itself, from its own environment, whenever it goes away.
+fn client_parent(pid: u32) -> Option<u32> {
+    let pp = process::parent(pid)?;
+    let exe = process::pid_exe(pp)?;
+    let name = exe.file_name()?.to_string_lossy().to_lowercase();
+    name.contains("opencode").then_some(pp)
+}
+
 /// `opencode service restart` (the service's own binary, so the desktop app accepts the new one)
 /// with `dir` added to PATH: the new service, and the shells and MCP servers it starts, inherit
-/// it. Refused while any session runs. Ok(false): no service is running, nothing to restart.
+/// it. Refused while any session runs, and when a live opencode client owns the service (it would
+/// start the replacement with its old PATH). Ok(false): no service is running.
 pub(crate) fn restart_service(dir: &Path) -> Result<bool, String> {
     let Some(Service {
         exe: Some(bin),
@@ -182,6 +192,11 @@ pub(crate) fn restart_service(dir: &Path) -> Result<bool, String> {
     else {
         return Ok(false);
     };
+    if let Some(c) = client_parent(old) {
+        return Err(format!(
+            "the service belongs to opencode pid {c}, which starts it with its own PATH"
+        ));
+    }
     match busy(&bin) {
         Some(0) => {}
         Some(n) => return Err(format!("{n} session(s) running")),
@@ -203,7 +218,13 @@ pub(crate) fn restart_service(dir: &Path) -> Result<bool, String> {
         .status()
         .map_err(|e| e.to_string())?;
     match service() {
-        Some(s) if s.exe.is_some() && s.pid != old => Ok(true),
+        // a connected client may have won the race and started it from its own environment
+        Some(s) if s.exe.is_some() && s.pid != old => match client_parent(s.pid) {
+            None => Ok(true),
+            Some(c) => Err(format!(
+                "opencode pid {c} started the service again with its own PATH"
+            )),
+        },
         _ => Err(format!("`opencode service restart` failed ({st})")),
     }
 }

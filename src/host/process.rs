@@ -236,6 +236,80 @@ pub(crate) fn pid_exe(pid: u32) -> Option<PathBuf> {
     (n > 0).then(|| PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..n as usize])))
 }
 
+/// Parent pid recorded for `pid` (the parent itself may be gone; unix reparents orphans).
+#[cfg(windows)]
+pub(crate) fn parent(pid: u32) -> Option<u32> {
+    use std::ffi::c_void;
+    #[repr(C)]
+    struct Entry {
+        size: u32,
+        usage: u32,
+        pid: u32,
+        heap: usize,
+        module: u32,
+        threads: u32,
+        parent: u32,
+        priority: i32,
+        flags: u32,
+        exe: [u16; 260],
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> *mut c_void;
+        fn Process32FirstW(snap: *mut c_void, e: *mut Entry) -> i32;
+        fn Process32NextW(snap: *mut c_void, e: *mut Entry) -> i32;
+        fn CloseHandle(h: *mut c_void) -> i32;
+    }
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(0x2, 0); // TH32CS_SNAPPROCESS
+        if snap.is_null() || snap as isize == -1 {
+            return None;
+        }
+        let mut e: Entry = std::mem::zeroed();
+        e.size = size_of::<Entry>() as u32;
+        let mut found = None;
+        let mut ok = Process32FirstW(snap, &mut e) != 0;
+        while ok {
+            if e.pid == pid {
+                found = Some(e.parent);
+                break;
+            }
+            ok = Process32NextW(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+        found
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn parent(pid: u32) -> Option<u32> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // "pid (comm) state ppid …": comm may contain spaces and parentheses
+    stat.rsplit_once(')')?
+        .1
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn parent(pid: u32) -> Option<u32> {
+    unsafe extern "C" {
+        fn proc_pidinfo(
+            pid: i32,
+            flavor: i32,
+            arg: u64,
+            buf: *mut std::ffi::c_void,
+            size: i32,
+        ) -> i32;
+    }
+    // struct proc_bsdinfo (PROC_PIDTBSDINFO = 3): 136 bytes, pbi_ppid is the 5th u32
+    let mut buf = [0u32; 34];
+    let n = unsafe { proc_pidinfo(pid as i32, 3, 0, buf.as_mut_ptr().cast(), 136) };
+    (n == 136).then_some(buf[4])
+}
+
 /// Member of BUILTIN\Administrators, elevated or not (what sshd's
 /// `Match Group administrators` sees). A UAC-filtered token still lists the
 /// group as deny-only, so this reads the token's groups rather than asking
