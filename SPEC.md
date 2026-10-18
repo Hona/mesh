@@ -709,6 +709,11 @@ Text rendering for the model:
   task runs from a non-elevated `schtasks /run`). Still to see: a second device's key arriving.
 - Windows sshd drops the exit status in pty mode (plain `ssh -t` too), so `exec -t` to a
   Windows device always exits 0. Non-`-t` exec is unaffected.
+- **Open decision: the elevated `keys` task.** It runs `meshw.exe` from the user-writable
+  install dir (and reads the user-writable cache), so code running as the user could swap the
+  binary or the cache and gain admin without a UAC prompt. Options: accept (status quo), or have
+  the task run a copy in `%ProgramFiles%\opencode-mesh\` that only elevated steps refresh, at the
+  cost of one UAC per `mesh update` on admin devices.
 - macOS Remote Login + full-disk-access flow (needs air online).
 - Debian VPS is not on Tailscale yet; it needs Tailscale to join.
 

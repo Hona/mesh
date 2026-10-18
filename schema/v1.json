@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Hona/mesh/main/schema/v1.json",
+  "title": "opencode mesh: mesh.json",
+  "description": "Marks a repo (or folder) as an opencode mesh and holds shared settings. All fields are optional.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "This schema's URL; it carries the file-format version (v1)."
+    },
+    "pin": {
+      "type": "string",
+      "description": "mesh version every device converges to (set by `mesh update`).",
+      "pattern": "^v?[0-9]+\\.[0-9]+\\.[0-9]+(-[0-9A-Za-z.-]+)?$",
+      "examples": ["0.2.0"]
+    },
+    "interval": {
+      "type": "string",
+      "description": "How often devices pull: seconds, or a number with s, m or h (minimum 1m).",
+      "pattern": "^[0-9]+[smh]?$",
+      "default": "10m"
+    }
+  },
+  "additionalProperties": false
+}
