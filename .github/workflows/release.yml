@@ -1,0 +1,104 @@
+# Build and publish release binaries for a v* tag (SPEC §10). Build only: no tests, no lint.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $v"
+            exit 1
+          fi
+
+  linux:
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain (static musl via zig)
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          python3 -m pip install --user --break-system-packages cargo-zigbuild
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Build
+        run: |
+          mkdir dist
+          for t in x86_64:x64 aarch64:arm64; do
+            cargo zigbuild --release --bin mesh --target "${t%%:*}-unknown-linux-musl"
+            cp "target/${t%%:*}-unknown-linux-musl/release/mesh" "dist/mesh-linux-${t##*:}"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: dist/*
+
+  macos:
+    needs: check
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-apple-darwin aarch64-apple-darwin
+          mkdir dist
+          for t in x86_64:x64 aarch64:arm64; do
+            cargo build --release --bin mesh --target "${t%%:*}-apple-darwin"
+            cp "target/${t%%:*}-apple-darwin/release/mesh" "dist/mesh-macos-${t##*:}"
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+
+  windows:
+    needs: check
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-pc-windows-msvc aarch64-pc-windows-msvc
+          mkdir dist
+          for t in x86_64:x64 aarch64:arm64; do
+            cargo build --release --target "${t%%:*}-pc-windows-msvc"
+            for b in mesh meshw; do
+              cp "target/${t%%:*}-pc-windows-msvc/release/$b.exe" "dist/$b-windows-${t##*:}.exe"
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+
+  release:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+          pre=""
+          case "$GITHUB_REF_NAME" in *-*) pre="--prerelease" ;; esac
+          gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes $pre *

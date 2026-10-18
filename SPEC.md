@@ -392,7 +392,8 @@ Pull-only. Never writes to the repo.
    - `<state>/ssh_config` from `devices/*.json` + current Tailscale IPs (`tailscale status --json`);
    - skills → `~/.config/opencode/skills/opencode-mesh/` (mesh-owned folder, replaced wholesale);
    - `AGENTS.md` → `~/.config/opencode/AGENTS.md` (§7.4).
-3. If `mesh.json` `pin` differs from this binary's version, self-update to the pin (§5.9).
+3. If `mesh.json` `pin` differs from this binary's version, self-update to the pin (§5.9 step 1
+   + MCP restart; either direction, no repo writes). Leftover `*.old` binaries are deleted.
 4. If skills changed, `opencode reload`.
 
 Prints a short diff (`+ device air`, `~ skill review`, …). Runs on schedule and lazily when a
@@ -423,7 +424,15 @@ mesh leave [--yes]           # this device
 `leave`: delete own `devices/*` (commit), then undo all local setup — MCP registration
 (`opencode api experimental.mcp.remove`), scheduled tasks, the managed keys block, the
 opt-in `Include` line, `skills/opencode-mesh/`, the state dir (incl. key). Leaves
-`~/.config/opencode/AGENTS.md` and an installed SSH server in place.
+`~/.config/opencode/AGENTS.md`, an installed SSH server and the mesh binaries in place.
+
+- `experimental.mcp.remove` only drops the running server, and the config API can't delete
+  entries, so `leave` cuts its own `mesh` entry (only if its command is mesh's) out of the
+  global config text, leaving every other byte as is, then removes it in every loaded location.
+- Admin Windows: the keys block and the `\opencode-mesh\keys` task need one UAC prompt (the
+  same elevated step as `up`). This build's mux is told to quit (frame `7`) before the state
+  dir is deleted.
+- `rm` refuses this device (use `leave`); without a terminal both need `--yes`.
 
 ### 5.9 `mesh update`
 
@@ -444,7 +453,15 @@ One command updates the whole mesh:
    location, as in §5.3 step 8).
 
 Devices never move to "latest" on their own — only to the pinned version.
-`--version` also rolls back. `--check` shows what's available.
+`--version` also rolls back. `--check` shows what's available. Without `--version`, "latest"
+is the highest release, counting prereleases only when this build is one.
+
+- Step 1 downloads `mesh-<os>-<arch>[.exe]` (+ `meshw-…` on Windows) and `SHA256SUMS` into
+  `<state>/update/`, then swaps them in at the §4.4 install path. Steps 2–4 run in the new
+  binary (`mesh update --version <v> --resume`), so the skill it pushes is the new one.
+- Run on a device by another device's step 3 (`MESH_FROM` is set), `update` does steps 1 and 4
+  only: no repo writes, no further fan-out.
+- Pin and skill go in one commit; nothing is committed when both are already current.
 `mesh update` and the exec handoff stay backward compatible, so a new binary can always tell
 an old one to update.
 
@@ -542,7 +559,7 @@ Details:
 - Frame: `[kind u8][id u32 LE][len u32 LE][len bytes]`. Kinds: `0 hello` (JSON, first frame
   each way the server speaks), `1 start` (envelope JSON; to the mux it also carries `device`),
   `2 stdin` (empty = EOF), `3 stdout`, `4 stderr`, `5 exit` (JSON `{code, error?}`), `6 cancel`
-  (kill the tree), `8 ping` (echoed). (`7` is retired.) Stream chunks ≤ 64 KiB. The mux
+  (kill the tree), `7 quit` (client → mux; only `leave`), `8 ping` (echoed). Stream chunks ≤ 64 KiB. The mux
   rewrites ids between clients and links; a client that disconnects cancels its commands.
 - Dead links: a link quiet for 20 s is pinged before reuse (one round trip; no answer in 3 s →
   redial transparently). The mux also pings quiet links and kills one that doesn't answer
@@ -677,13 +694,17 @@ Text rendering for the model:
   `mesh-windows-arm64.exe`, `meshw-windows-arm64.exe`, `SHA256SUMS`.
 - Release profile: `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`,
   `strip = true`. Targets: < ~1 MB binary, ~1–2 MB idle RSS for `mesh mcp`.
-- CI (`release.yml`): cross-build all targets and publish. **No test steps.**
+- CI (`release.yml`): on a `v*` tag, fail unless it matches the `Cargo.toml` version, build
+  all targets (Linux musl via cargo-zigbuild, both macOS on one runner, both Windows MSVC),
+  write `SHA256SUMS`, publish the release (prerelease when the tag has a `-`). **No test steps.**
 - Install, macOS/Linux:
   `gh api repos/Hona/mesh/contents/install.sh -H "Accept: application/vnd.github.raw" | sh`
 - Install, Windows:
   `gh api repos/Hona/mesh/contents/install.ps1 -H "Accept: application/vnd.github.raw" | Out-String | iex`
-- Both download via `gh release download`, install to the paths in §4.4, add to user PATH, then
-  run `mesh up`.
+- Both download via `gh release download` (latest, or `MESH_VERSION=<x.y.z>`), check
+  `SHA256SUMS`, then run `mesh up` from the download folder; `up` installs to the paths in §4.4
+  (rename-aside if in use), adds the user PATH and restarts the MCP server. Arguments for `up`:
+  `| sh -s -- <args>` / `$env:MESH_UP_ARGS`.
 - Copy-paste prompt (any OS):
   > Install opencode mesh on this device: use `gh release download` to get the `mesh` binary
   > for this OS and CPU from the latest `Hona/mesh` release, put it in a user bin folder on
