@@ -2,7 +2,7 @@
 
 A tiny native binary that joins your devices into an **opencode mesh**: from any opencode session, on any device, the agent can run anything (including the `opencode` CLI) on any other device.
 
-A command on another device takes ~35 ms, and mesh idles at 0.8 MB of RAM.
+On my machines, running a command on another device takes about 35 ms, and mesh idles at 0.8 MB of RAM.
 
 ```sh
 # install + join, on each device (needs gh, opencode, Tailscale)
