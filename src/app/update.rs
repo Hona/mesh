@@ -242,6 +242,8 @@ fn publish(state: &State, version: &str, say: &dyn Fn(&'static str, &str, String
     };
     if !files.is_empty() {
         reg.commit(&files, &format!("mesh update: {version}"))?;
+        // so `status` here sees the new pin right away
+        sync::fetch(&reg)?;
     }
     say(
         "ok",
