@@ -21,7 +21,10 @@ pub(crate) struct Opts {
     pub name: Option<String>,
     pub public: bool,
     pub yes: bool,
+    /// AGENTS.md only.
     pub prefer_local: bool,
+    /// Local skills to upload (never implied by --prefer or --yes).
+    pub upload_skills: Vec<String>,
     pub check: bool,
     pub wait: bool,
     pub skip: Vec<String>,
@@ -595,15 +598,19 @@ impl Up<'_> {
             let in_mesh = index
                 .keys()
                 .any(|k| k.starts_with(&format!("skills/{id}/")));
-            let choice = if in_mesh {
+            // Skills are uploaded one by one, only when asked: a per-skill answer or
+            // --upload-skill. --prefer decides AGENTS.md only.
+            let choice = if self.o.upload_skills.contains(&id) {
+                'u'
+            } else if in_mesh {
                 let q =
                     format!("skill {id} is both here and in the mesh: [k]eep mesh / [u]pload this");
-                self.choose(&q, "ku", if self.o.prefer_local { 'u' } else { 'k' })
+                self.choose(&q, "ku", 'k')
             } else {
                 let q = format!(
                     "skill {id} is only on this device: [u]pload / [k]eep local / [d]elete"
                 );
-                self.choose(&q, "ukd", if self.o.prefer_local { 'u' } else { 'k' })
+                self.choose(&q, "ukd", 'k')
             };
             if self.o.check {
                 self.info(

@@ -242,8 +242,9 @@ mesh up [--repo <owner/name>] [--path <dir>] [--name <device>] [--public]
 | `--path` | subfolder within the repo |
 | `--name` | device name; default Tailscale short name |
 | `--public` | create the repo public (default private) |
-| `--yes` | non-interactive (agents/scripts); conflicts default to `--prefer mesh` |
-| `--prefer` | conflict default: `mesh` (keep mesh, back up local) or `local` (upload local) |
+| `--yes` | non-interactive (agents/scripts); `AGENTS.md` defaults to `--prefer mesh`, local skills stay local |
+| `--prefer` | `AGENTS.md` only: `mesh` (keep mesh, back up local) or `local` (upload local). Never uploads skills |
+| `--upload-skill` | `<id>[,<id>…]`, repeatable: upload these local skills to the mesh (the only non-interactive way) |
 | `--check` | report what would change; change nothing |
 | `--wait` | after joining, poll until peers have synced and accept this device |
 | `--skip` | skip steps: `sshd`, `mcp`, `schedule` |
@@ -646,8 +647,13 @@ ssh-ed25519 AAAA… opencode-mesh:air
 - **Joining:** if local `AGENTS.md` differs from the mesh's, show the diff and ask:
   `[k]eep mesh` (back up local, replace) / `[u]pload this` (replaces it for every device;
   pushed) / `[e]dit` (merge by hand, then keep or upload). Local skills not in the mesh:
-  upload / keep local / delete. Same-ID skills in both: same diff prompt.
-- `--yes` defaults to `--prefer mesh`; never uploads unless `--prefer local`.
+  upload / keep local / delete. Same-ID skills in both: `[k]eep mesh` (back up local) /
+  `[u]pload this`.
+- `--yes` defaults to `--prefer mesh`, which (like `--prefer local`) decides only `AGENTS.md`.
+- Skills are never bulk-uploaded: each upload is its own answer, or `--upload-skill <id>`.
+  Non-interactive without it, local-only skills stay local and same-ID ones keep the mesh's.
+- The first sync on a device names its `AGENTS.md` backup as the previous file, not as an
+  edit "since the last sync".
 
 ## 8. MCP server
 

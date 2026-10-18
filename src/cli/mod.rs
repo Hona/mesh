@@ -21,7 +21,7 @@ Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version
 
   up       create a mesh or join this device     mesh up [--repo <owner/name>] [--path <dir>] [--name <device>]
                                                    [--public] [--yes] [--prefer mesh|local] [--check] [--wait]
-                                                   [--skip sshd,mcp,schedule]
+                                                   [--skip sshd,mcp,schedule] [--upload-skill <id,...>]
   sync     pull the mesh and apply it here       mesh sync [--force] [--keys-only]
   rm       remove a device from the mesh         mesh rm <device> [--yes]
   leave    remove this device from the mesh      mesh leave [--yes]
@@ -162,6 +162,7 @@ fn up(args: &[String], out: &Out) -> Result<i32, Fail> {
         public: false,
         yes: false,
         prefer_local: false,
+        upload_skills: Vec::new(),
         check: false,
         wait: false,
         skip: Vec::new(),
@@ -194,6 +195,12 @@ fn up(args: &[String], out: &Out) -> Result<i32, Fail> {
             "--check" => o.check = true,
             "--wait" => o.wait = true,
             "--skip" => o.skip = value()?.split(',').map(|s| s.trim().to_string()).collect(),
+            "--upload-skill" => o.upload_skills.extend(
+                value()?
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty()),
+            ),
             _ => return Err(usage("up", format!("unexpected argument {a:?}"))),
         }
     }

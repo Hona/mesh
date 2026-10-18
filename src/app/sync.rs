@@ -311,10 +311,14 @@ fn agents(index: &Index, r: &mut SyncReport) -> Result<(), String> {
         if let Some(edited) = local.as_ref().filter(|l| last.as_ref() != Some(*l)) {
             let backup = store::new_backup_dir().join("AGENTS.md");
             store::write_file(&backup, edited)?;
-            r.warnings.push(format!(
-                "local AGENTS.md was edited since the last sync; backed up to {}",
-                backup.display()
-            ));
+            r.warnings.push(match last {
+                // first sync on this device: there is no "last sync" to have edited since
+                None => format!("backed up the previous AGENTS.md to {}", backup.display()),
+                Some(_) => format!(
+                    "local AGENTS.md was edited since the last sync; backed up to {}",
+                    backup.display()
+                ),
+            });
         }
         store::write_file(&target, &mesh)?;
         r.changes.push(format!(
