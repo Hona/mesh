@@ -331,8 +331,9 @@ mesh status [<target>] [--fast] [--json]
 
 Default target `all`. Without `--fast`, each online device is probed in parallel over the
 handoff (§6.2) by running `mesh status self --json` there, which reports local facts:
-opencode version + whether the service is up (from `service.json`, §6.4), busy session count
-(`opencode api session.active`), mesh version. `--fast` uses only the repo cache + Tailscale.
+opencode version + the service state (below), busy session count (`opencode api
+session.active`, only asked of a service that answers), mesh version. `--fast` uses only the
+repo cache + Tailscale.
 
 ```
 DEVICE   OS       SHELL       ONLINE  OPENCODE  BUSY  MESH
@@ -346,7 +347,22 @@ local `AGENTS.md` edits that were backed up, last sync time/commit.
 
 OPENCODE is the version of the opencode `mesh exec <device> opencode` would run (§6.4). If the
 running service is a different version it is appended, `2.0.28 (service 0.0.0-beta-21153)`
-(JSON: `opencode.service_version`, present only then); `(down)` when no service runs.
+(JSON: `opencode.service_version`, present only then).
+
+The service state (JSON `opencode.service`) is shown when it isn't `ok`, e.g.
+`2.0.28 (service hung)`:
+
+| State | Meaning | Check |
+|---|---|---|
+| `ok` | answers | `GET /api/info` on `service.json`'s url gets any HTTP status (401 too; the password is never read) within 2 s |
+| `down` | not running | no `service.json` (stopped cleanly) |
+| `stale` | crashed / killed | `service.json` names a dead pid |
+| `hung` | alive, not answering | pid alive, no HTTP answer within 2 s (connect 1 s) |
+
+A raw `TcpStream` with timeouts, no `opencode` spawn. `status` never hangs on a broken opencode:
+every opencode spawn mesh makes (version, busy, config, reload, MCP restarts) has a hard limit
+(3 s for status probes, 20 s otherwise) and is skipped when the service doesn't answer.
+Older devices send `service: true|false` (read as `ok` / `down`).
 
 ### 5.5 `mesh exec`
 
@@ -722,7 +738,8 @@ ssh-ed25519 AAAA… opencode-mesh:air
   "devices": [
     { "name": "blade", "self": false, "os": "windows", "arch": "x64", "shell": "powershell",
       "user": "lukem", "online": true, "reachable": true, "latency_ms": 38,
-      "opencode": { "version": "2.0.32", "busy": 1, "service": true }, "mesh": "0.1.0" } ] }
+      "opencode": { "version": "2.0.32", "busy": 1, "service": "ok" }, "mesh": "0.1.0" } ] }
+// "service": "ok" | "down" | "stale" | "hung" (§5.4)
 ```
 
 ### 8.2 `exec`
@@ -752,6 +769,11 @@ Text rendering for the model:
 ## 9. Built-in skill
 
 - Source: `skill/SKILL.md` in this repo, embedded into the binary.
+- Besides the reference, it carries a short **Recovery** section (≤10 lines): the service
+  states (§5.4), then the exact `mesh exec` lines for start/restart (durable automatically),
+  a hung service (`opencode service stop` with `--timeout`, else kill the `service.json`
+  pid), the log (`~/.local/share/opencode/log/opencode.log`) and `opencode upgrade
+  [<version>]` (rollback); run from another device, since `mesh` doesn't need opencode.
 - Lives in the mesh repo at `skills/mesh/SKILL.md` and reaches devices through normal sync.
 - Written to the repo only by `mesh up` (when creating a mesh) and `mesh update`.
 - When writing, the binary adds frontmatter `metadata.mesh/version` (its version) and

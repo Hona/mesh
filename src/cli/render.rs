@@ -1,7 +1,7 @@
 //! Text and JSON output (shared by the CLI and the MCP server).
 
 use crate::app::exec::{self, Event, Input};
-use crate::model::{Device, Envelope, ExecResult, Status, Step, SyncReport};
+use crate::model::{Device, Envelope, ExecResult, ServiceState, Status, Step, SyncReport};
 use serde::Serialize;
 use std::io::Write;
 
@@ -94,10 +94,10 @@ pub(crate) fn status_text(s: &Status) -> String {
             }
             .into(),
             oc.map_or("-".into(), |o| {
-                let note = match (&o.service_version, o.service) {
-                    (Some(v), _) => format!(" (service {v})"),
-                    (None, true) => String::new(),
-                    (None, false) => " (down)".into(),
+                let note = match (o.service, &o.service_version) {
+                    (ServiceState::Ok, Some(v)) => format!(" (service {v})"),
+                    (ServiceState::Ok, None) => String::new(),
+                    (s, _) => format!(" (service {})", s.as_str()),
                 };
                 format!("{}{note}", o.version.as_deref().unwrap_or("?"))
             }),

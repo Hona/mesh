@@ -36,6 +36,54 @@ pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
     c
 }
 
+/// Run `cmd` (stdin null) for at most `limit`: (success, stdout, stderr), or None if it couldn't
+/// start or was killed at the limit. Never waits on a grandchild still holding the pipes.
+pub(crate) fn output_within(
+    cmd: &mut Command,
+    limit: std::time::Duration,
+) -> Option<(bool, Vec<u8>, Vec<u8>)> {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let reader = |s: Option<Box<dyn Read + Send>>| {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            if let Some(mut s) = s {
+                let _ = s.read_to_end(&mut b);
+            }
+            let _ = tx.send(b);
+        });
+        rx
+    };
+    let out = reader(child.stdout.take().map(|s| Box::new(s) as _));
+    let err = reader(child.stderr.take().map(|s| Box::new(s) as _));
+    let t0 = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                let grace = Duration::from_millis(300);
+                return Some((
+                    st.success(),
+                    out.recv_timeout(grace).unwrap_or_default(),
+                    err.recv_timeout(grace).unwrap_or_default(),
+                ));
+            }
+            Ok(None) if t0.elapsed() < limit => std::thread::sleep(Duration::from_millis(15)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+}
+
 /// Kills a spawned process and everything it started.
 pub(crate) struct Killer {
     #[cfg(windows)]

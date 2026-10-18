@@ -139,12 +139,51 @@ pub(crate) struct Peer {
     pub online: bool,
 }
 
+/// The opencode service (SPEC §5.4).
+#[derive(Serialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ServiceState {
+    /// Its HTTP server answers.
+    Ok,
+    /// Not registered (no `service.json`).
+    Down,
+    /// Registered and alive, but no HTTP answer within 2 s.
+    Hung,
+    /// `service.json` names a dead pid.
+    Stale,
+}
+
+impl ServiceState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Down => "down",
+            Self::Hung => "hung",
+            Self::Stale => "stale",
+        }
+    }
+
+    /// From a device's status JSON: a state, or the bool older versions sent.
+    pub fn from_json(v: Option<&serde_json::Value>) -> Self {
+        match v {
+            Some(serde_json::Value::Bool(true)) => Self::Ok,
+            Some(serde_json::Value::String(s)) => match s.as_str() {
+                "ok" => Self::Ok,
+                "hung" => Self::Hung,
+                "stale" => Self::Stale,
+                _ => Self::Down,
+            },
+            _ => Self::Down,
+        }
+    }
+}
+
 #[derive(Serialize, Clone)]
 pub(crate) struct Opencode {
     /// The opencode `mesh exec <device> opencode` runs (SPEC §6.4).
     pub version: Option<String>,
     pub busy: Option<u64>,
-    pub service: bool,
+    pub service: ServiceState,
     /// The running service's version, only when it differs from `version`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub service_version: Option<String>,

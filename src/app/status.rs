@@ -5,7 +5,7 @@
 use super::exec::{self, Input};
 use super::{Fail, R, VERSION, skill, store};
 use crate::host::opencode;
-use crate::model::{DeviceStatus, Envelope, Opencode, Status};
+use crate::model::{DeviceStatus, Envelope, Opencode, ServiceState, Status};
 use crate::network;
 use std::collections::HashMap;
 
@@ -39,7 +39,7 @@ fn probe_remote(me: &str, devices: &[crate::model::Device]) -> HashMap<String, P
             let opencode = d["opencode"].as_object().map(|o| Opencode {
                 version: o.get("version").and_then(|x| x.as_str()).map(String::from),
                 busy: o.get("busy").and_then(|x| x.as_u64()),
-                service: o.get("service").and_then(|x| x.as_bool()).unwrap_or(false),
+                service: ServiceState::from_json(o.get("service")),
                 service_version: o
                     .get("service_version")
                     .and_then(|x| x.as_str())

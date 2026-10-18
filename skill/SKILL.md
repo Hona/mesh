@@ -31,6 +31,20 @@ On Windows and macOS devices, tools that keep their login in the OS credential s
 
 Don't send work back to the device that sent it to you (`MESH_FROM` is set on remote commands).
 
+Use `--durable` (MCP `durable: true`) when what the command starts must keep running after it returns.
+
+## Recovery
+
+`mesh status` OPENCODE: `(service down)` not running · `(service stale)` crashed (service.json names a dead pid) · `(service hung)` running, not answering. The `mesh` CLI doesn't need opencode: fix a broken device from another one.
+
+    mesh exec blade opencode service start              # down / stale (start|restart are durable automatically)
+    mesh exec --timeout 20 blade opencode service stop  # hung; if that times out, kill the pid, then start:
+    mesh exec blade -c 'Stop-Process -Force -Id (Get-Content ~/.local/state/opencode/service.json | ConvertFrom-Json).pid'
+    mesh exec blade -c 'Get-Content ~/.local/share/opencode/log/opencode.log -Tail 50'
+    mesh exec blade opencode upgrade [<version>]        # latest, or roll back to <version>
+
+A running desktop app starts its service again by itself within seconds.
+
 ## Examples
 
     mesh exec server opencode run "pull main and run the tests"

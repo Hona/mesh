@@ -1,15 +1,17 @@
 //! Finding and asking the local opencode install (SPEC §6.4).
 
 use super::{paths, process, vlog};
-use crate::model::Opencode;
+use crate::model::{Opencode, ServiceState};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 // Only these fields are read from service.json, never `password`.
 #[derive(Deserialize)]
 struct ServiceFile {
     version: Option<String>,
     pid: Option<u32>,
+    url: Option<String>,
 }
 
 struct Service {
@@ -17,7 +19,12 @@ struct Service {
     pid: u32,
     /// Executable of the live service process; None if it isn't running.
     exe: Option<PathBuf>,
+    url: Option<String>,
 }
+
+/// Every opencode spawn has a hard limit: a broken service must never hang mesh.
+const QUICK: Duration = Duration::from_secs(3);
+const SLOW: Duration = Duration::from_secs(20);
 
 fn service() -> Option<Service> {
     let bytes = std::fs::read(paths::opencode_state_dir().join("service.json")).ok()?;
@@ -31,7 +38,43 @@ fn service() -> Option<Service> {
         version: f.version,
         pid,
         exe,
+        url: f.url,
     })
+}
+
+/// Does the service's HTTP server answer `GET /api/info` within ~2 s? Any HTTP status counts
+/// (it may want auth; the password is never read). A suspended or wedged server accepts the
+/// connection but never answers.
+fn answers(url: &str) -> bool {
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, ToSocketAddrs};
+    let host = url
+        .trim_start_matches("http://")
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .replace("0.0.0.0", "127.0.0.1");
+    let Some(addr) = host.to_socket_addrs().ok().and_then(|mut a| a.next()) else {
+        return false;
+    };
+    let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else {
+        return false;
+    };
+    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
+    let req = format!("GET /api/info HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let mut head = [0u8; 5];
+    s.write_all(req.as_bytes()).is_ok() && s.read_exact(&mut head).is_ok() && &head == b"HTTP/"
+}
+
+/// ok / down / stale / hung (SPEC §5.4).
+fn state(svc: Option<&Service>) -> ServiceState {
+    match svc {
+        None => ServiceState::Down,
+        Some(Service { exe: None, .. }) => ServiceState::Stale,
+        Some(Service { url: Some(u), .. }) if !answers(u) => ServiceState::Hung,
+        Some(_) => ServiceState::Ok,
+    }
 }
 
 /// PATH, then the running service's executable, then known install locations.
@@ -101,8 +144,8 @@ fn known() -> Vec<PathBuf> {
 }
 
 fn version(bin: &Path) -> Option<String> {
-    let out = process::command(bin).arg("--version").output().ok()?;
-    let s = String::from_utf8_lossy(&out.stdout);
+    let (_, out, _) = process::output_within(process::command(bin).arg("--version"), QUICK)?;
+    let s = String::from_utf8_lossy(&out);
     Some(
         s.split_whitespace()
             .last()?
@@ -111,15 +154,14 @@ fn version(bin: &Path) -> Option<String> {
     )
 }
 
+/// Only asked of a service that answers (`opencode api` could start one otherwise).
 fn busy(bin: &Path) -> Option<u64> {
-    let out = process::command(bin)
-        .args(["api", "session.active"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
+    let (ok, out, _) =
+        process::output_within(process::command(bin).args(["api", "session.active"]), QUICK)?;
+    if !ok {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&out).ok()?;
     match &v["data"] {
         serde_json::Value::Object(m) => Some(m.len() as u64),
         serde_json::Value::Array(a) => Some(a.len() as u64),
@@ -129,7 +171,8 @@ fn busy(bin: &Path) -> Option<u64> {
 
 /// Local opencode facts; None if opencode isn't installed. `version` is the opencode that
 /// `mesh exec … opencode` runs (§6.4); the running service's version is added only when it
-/// differs. Never starts the service: busy is only asked of a running one.
+/// differs. Never starts the service and never hangs on a broken one: a direct HTTP check
+/// decides the state, busy is only asked of a service that answers, every spawn is time-boxed.
 pub(crate) fn probe() -> Option<Opencode> {
     let svc = service();
     let (bin, how) = find(svc.as_ref())?;
@@ -137,19 +180,20 @@ pub(crate) fn probe() -> Option<Opencode> {
     let running = svc
         .as_ref()
         .and_then(|s| s.exe.as_ref().map(|exe| (exe.clone(), s.version.clone())));
-    let up = running.is_some();
     // exec runs the service's own binary: service.json already has its version, no spawn
     let known = running
         .as_ref()
         .filter(|(exe, _)| *exe == bin)
         .and_then(|(_, v)| v.clone());
-    let (exec_version, busy) = std::thread::scope(|s| {
+    let (exec_version, st, busy) = std::thread::scope(|s| {
         let v = known.is_none().then(|| s.spawn(|| version(&bin)));
-        let b = up.then(|| busy(&bin)).flatten();
+        let st = state(svc.as_ref());
+        let b = (st == ServiceState::Ok).then(|| busy(&bin)).flatten();
         (
             known
                 .clone()
                 .or_else(|| v.and_then(|h| h.join().ok().flatten())),
+            st,
             b,
         )
     });
@@ -159,7 +203,7 @@ pub(crate) fn probe() -> Option<Opencode> {
     Some(Opencode {
         version: exec_version,
         busy,
-        service: up,
+        service: st,
         service_version,
     })
 }
@@ -209,14 +253,27 @@ pub(crate) fn restart_service(dir: &Path) -> Result<bool, String> {
     }
     let path = std::env::join_paths(path).map_err(|e| e.to_string())?;
     // No pipes: the new service could inherit them and keep this call from ever returning.
-    let st = process::command(&bin)
+    let mut child = process::command(&bin)
         .args(["service", "restart"])
         .env("PATH", path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status()
+        .spawn()
         .map_err(|e| e.to_string())?;
+    let t0 = std::time::Instant::now();
+    let st = loop {
+        match child.try_wait() {
+            Ok(Some(st)) => break st.to_string(),
+            Ok(None) if t0.elapsed() < Duration::from_secs(60) => {
+                std::thread::sleep(Duration::from_millis(50))
+            }
+            _ => {
+                let _ = child.kill();
+                break "didn't finish in 60 s".into();
+            }
+        }
+    };
     match service() {
         // a connected client may have won the race and started it from its own environment
         Some(s) if s.exe.is_some() && s.pid != old => match client_parent(s.pid) {
@@ -248,13 +305,15 @@ pub(crate) fn installed() -> Option<(String, Option<u32>)> {
 /// The global config document holding MCP server `name`, and its command.
 fn mcp_doc(name: &str) -> Result<Option<(PathBuf, Vec<String>)>, String> {
     let bin = bin().ok_or("opencode not found")?;
-    let out = process::command(bin)
-        .args(["debug", "config"])
-        .current_dir(paths::home())
-        .output()
-        .map_err(|e| e.to_string())?;
+    let (_, out, _) = process::output_within(
+        process::command(bin)
+            .args(["debug", "config"])
+            .current_dir(paths::home()),
+        SLOW,
+    )
+    .ok_or("`opencode debug config` didn't finish in 20 s")?;
     let v: serde_json::Value =
-        serde_json::from_slice(&out.stdout).map_err(|e| format!("opencode debug config: {e}"))?;
+        serde_json::from_slice(&out).map_err(|e| format!("opencode debug config: {e}"))?;
     let global = paths::config_dir();
     for src in v.as_array().into_iter().flatten() {
         let Some(path) = src["path"].as_str().map(PathBuf::from) else {
@@ -288,15 +347,16 @@ pub(crate) fn mcp_entry(name: &str) -> Result<Option<Vec<String>>, String> {
 /// `opencode mcp add <name> --global -- <command…>`
 pub(crate) fn mcp_add(name: &str, command: &[&str]) -> Result<(), String> {
     let bin = bin().ok_or("opencode not found")?;
-    let out = process::command(bin)
-        .args(["mcp", "add", name, "--global", "--"])
-        .args(command)
-        .current_dir(paths::home())
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        let msg = String::from_utf8_lossy(&out.stderr).to_string()
-            + &String::from_utf8_lossy(&out.stdout);
+    let (ok, out, err) = process::output_within(
+        process::command(bin)
+            .args(["mcp", "add", name, "--global", "--"])
+            .args(command)
+            .current_dir(paths::home()),
+        SLOW,
+    )
+    .ok_or("`opencode mcp add` didn't finish in 20 s")?;
+    if !ok {
+        let msg = String::from_utf8_lossy(&err).to_string() + &String::from_utf8_lossy(&out);
         return Err(msg.trim().to_string());
     }
     Ok(())
@@ -306,15 +366,15 @@ pub(crate) fn mcp_add(name: &str, command: &[&str]) -> Result<(), String> {
 /// None if the service isn't running or the locations can't be listed; else how many succeeded.
 fn each_location(name: &str, ops: &[&str]) -> Option<usize> {
     let svc = service();
-    if !svc.as_ref().is_some_and(|s| s.exe.is_some()) {
+    if state(svc.as_ref()) != ServiceState::Ok {
         return None;
     }
     let (bin, _) = find(svc.as_ref())?;
-    let out = process::command(&bin)
-        .args(["api", "debug.location.list"])
-        .output()
-        .ok()?;
-    let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    let (_, out, _) = process::output_within(
+        process::command(&bin).args(["api", "debug.location.list"]),
+        SLOW,
+    )?;
+    let v: serde_json::Value = serde_json::from_slice(&out).ok()?;
     let locations: Vec<String> = v
         .as_array()?
         .iter()
@@ -329,10 +389,12 @@ fn each_location(name: &str, ops: &[&str]) -> Option<usize> {
                 s.spawn(move || {
                     let loc = format!("location[directory]={loc}");
                     ops.iter().all(|op| {
-                        process::command(bin)
-                            .args(["api", op, "--param", server, "--param", &loc])
-                            .output()
-                            .is_ok_and(|o| o.status.success())
+                        process::output_within(
+                            process::command(bin)
+                                .args(["api", op, "--param", server, "--param", &loc]),
+                            SLOW,
+                        )
+                        .is_some_and(|(ok, _, _)| ok)
                     })
                 })
             })
@@ -525,17 +587,17 @@ fn member(b: &[u8], i: &mut usize, path: &[&str]) -> Option<(usize, usize)> {
 /// `opencode reload` if the service is running. Ok(false) if it isn't.
 pub(crate) fn reload() -> Result<bool, String> {
     let svc = service();
-    if !svc.as_ref().is_some_and(|s| s.exe.is_some()) {
-        return Ok(false);
+    match state(svc.as_ref()) {
+        ServiceState::Ok => {}
+        ServiceState::Hung => return Err("the opencode service doesn't answer (hung)".into()),
+        _ => return Ok(false),
     }
     let (bin, how) = find(svc.as_ref()).ok_or("opencode not found")?;
     vlog!("opencode: {} ({how})", bin.display());
-    let out = process::command(bin)
-        .arg("reload")
-        .output()
-        .map_err(|e| e.to_string())?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
+    let (ok, _, err) = process::output_within(process::command(bin).arg("reload"), SLOW)
+        .ok_or("`opencode reload` didn't finish in 20 s")?;
+    if !ok {
+        return Err(String::from_utf8_lossy(&err).trim().to_string());
     }
     Ok(true)
 }
