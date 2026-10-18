@@ -166,22 +166,26 @@ pub(crate) fn envelope(arg: Option<&str>) -> i32 {
     };
     let timed_out = Arc::new(AtomicBool::new(false));
     if let Some(t) = env.ok().and_then(|e| e.timeout) {
-        let (k, flag) = (Arc::new(killer), timed_out.clone());
+        let k = Arc::new(killer);
+        let (k2, flag) = (k.clone(), timed_out.clone());
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs_f64(t));
             flag.store(true, Ordering::Relaxed);
-            k.kill();
+            k2.kill();
         });
         let c = code(child.wait());
         return if timed_out.load(Ordering::Relaxed) {
             TIMED_OUT
         } else {
+            k.release();
             c
         };
     }
-    // The job (Windows) lives until the command is done, then takes any leftovers with it.
-    let _job = killer;
-    code(child.wait())
+    // A normal exit leaves what the command started running; only timeout, cancel and a lost
+    // client kill the tree (this process dying closes the still kill-on-close job).
+    let c = code(child.wait());
+    killer.release();
+    c
 }
 
 type Out = Arc<Mutex<io::Stdout>>;
@@ -320,6 +324,9 @@ fn start(id: u32, data: &[u8], out: &Out, table: &Table) -> Result<(), (i32, Str
     std::thread::spawn(move || {
         let st = child.wait();
         drop(done_tx);
+        if !timed_out.load(Ordering::Relaxed) {
+            killer.release();
+        }
         for p in pumps {
             let _ = p.join();
         }

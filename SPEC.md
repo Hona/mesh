@@ -370,6 +370,9 @@ mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--json] <target> -c '
 - `--timeout`: enforced **on the remote side** (kills the whole process tree: a job object on
   Windows, a process group on unix; exit code 124, `error: "timeout after Ns"`), plus a local
   backstop at timeout + 15 s. CLI default: none.
+- The tree is killed **only** on timeout, cancel (Ctrl-C, MCP cancel) or the client going away
+  mid-command. A command that exits by itself leaves what it started running (Windows: the job
+  stops being kill-on-close; it allows breakaway).
 - A target naming a device missing from the cache runs one sync first (§5.1).
 - The remote process gets `MESH_FROM=<calling device>`.
 - For long-lived background commands, use opencode's own shells:

@@ -98,10 +98,12 @@ pub(crate) fn spawn_tree(cmd: &mut Command) -> io::Result<(Child, Killer)> {
             return Err(io::Error::last_os_error());
         }
         let killer = Killer { job };
+        // KILL_ON_JOB_CLOSE (cleared by `release` on a normal exit) | BREAKAWAY_OK (a process
+        // that asks to leave, like a detached mux, may)
         let mut info = ExtendedLimit {
-            limit_flags: 0x2000,
+            limit_flags: 0x2000 | 0x800,
             ..Default::default()
-        }; // KILL_ON_JOB_CLOSE
+        };
         job::SetInformationJobObject(
             job,
             9,
@@ -127,6 +129,25 @@ pub(crate) fn spawn_tree(cmd: &mut Command) -> io::Result<(Child, Killer)> {
 }
 
 impl Killer {
+    /// The command exited by itself: leave what it started running (SPEC §5.5). Windows: the
+    /// job stops being kill-on-close, so closing it later kills nothing. Unix: nothing to do,
+    /// the group is only ever signalled by `kill`.
+    pub(crate) fn release(&self) {
+        #[cfg(windows)]
+        unsafe {
+            let mut info = ExtendedLimit {
+                limit_flags: 0x800,
+                ..Default::default()
+            };
+            job::SetInformationJobObject(
+                self.job,
+                9,
+                (&mut info as *mut ExtendedLimit).cast(),
+                size_of::<ExtendedLimit>() as u32,
+            );
+        }
+    }
+
     pub(crate) fn kill(&self) {
         #[cfg(windows)]
         unsafe {
