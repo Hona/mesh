@@ -114,7 +114,7 @@ Not in v1: `sources` (pulling skills from other people's repos).
   "host": "lukeblade",           // network host name (Tailscale name); address resolved locally at sync time
   "os": "windows",               // linux | macos | windows
   "arch": "x64",                 // x64 | arm64
-  "shell": "powershell",         // the SSH server's actual default shell (used by `exec -c`)
+  "shell": "pwsh",               // shell mesh uses for `exec -c` (see below)
   "user": "lukem",               // SSH login user
   "mesh": "C:\\Users\\lukem\\AppData\\Local\\Programs\\mesh\\mesh.exe"   // absolute path
 }
@@ -122,6 +122,12 @@ Not in v1: `sources` (pulling skills from other people's repos).
 
 No opencode path is stored: it changes on every opencode update (§6.4).
 No Tailscale IPs or tailnet domain are stored (public-safe).
+
+`shell` is the shell mesh itself runs `exec -c` strings in, chosen by `mesh up` and then
+static: Windows `pwsh` → `powershell` → `cmd`, the first installed (file checks only; pwsh via
+PATH, then `%ProgramFiles%\PowerShell\7\pwsh.exe`); Linux/macOS the login shell. `up` records the
+name here and the absolute path in local `state.json`; re-running `up` re-detects. It is not
+sshd's DefaultShell, which mesh never reads or changes (it only wraps mesh's own handoff).
 
 ### 4.3 Device names
 
@@ -138,7 +144,10 @@ State dir: `~/.local/share/opencode-mesh/` (respect `XDG_DATA_HOME`) on Linux/ma
 
 ```
 state.json        # { "registry": { "kind": "github", "repo", "path", "branch" },
-                  #   "device", "synced": "<commit sha>" }
+                  #   "device", "shell": { "name": "pwsh", "path": "<abs path>" },
+                  #   "synced": "<commit sha>" }
+sync.lock         # held during a sync (pid inside; taken over if that process is gone)
+mux.sock          # Linux/macOS: the mux's local socket (dir is 0700)
 id_ed25519(.pub)  # this device's mesh key (permissions locked to the user)
 ssh_config        # generated; used via `ssh -F` for every mesh connection
 known_hosts       # generated from devices/*.host.pub
@@ -271,8 +280,11 @@ mesh up · Hona/opencode-mesh · adais
   ✓ tailscale  adais (online)
   ✓ repo       Hona/opencode-mesh
   ✓ key        created
-  ! sshd       not installed — approve the UAC prompt
-  ✓ sshd       running · shell: cmd · keys: administrators_authorized_keys (managed task)
+  ✓ shell      pwsh for exec -c
+  ! sshd       installing OpenSSH Server via Windows Update: this can take several minutes
+  ! sshd       install OpenSSH Server, …: approve the UAC prompt
+  … sshd       still working · 2m40s
+  ✓ sshd       running · keys: administrators_authorized_keys (managed task)
   ? AGENTS.md  differs from the mesh  [k]eep mesh / [u]pload this / [e]dit
   ✓ device     devices/adais.{json,pub,host.pub} pushed
   ✓ sync       3 devices · 2 skills
@@ -281,6 +293,10 @@ mesh up · Hona/opencode-mesh · adais
   ✓ self-test  adais → opencode 2.0.32
   … peers      blade, air accept adais after their next sync (≤10m)
 ```
+
+Any step that can block for more than a few seconds (the elevated step, the macOS settings
+wait, `--wait`) prints an elapsed-time heartbeat (same line on a terminal, else every ~30 s).
+`--check` refreshes the local cache but changes nothing else.
 
 ### 5.4 `mesh status`
 
@@ -295,7 +311,7 @@ opencode version + whether the service is up (from `service.json`, §6.4), busy 
 
 ```
 DEVICE   OS       SHELL       ONLINE  OPENCODE  BUSY  MESH
-adais *  windows  cmd         yes     2.0.32    0     0.1.0
+adais *  windows  pwsh        yes     2.0.32    0     0.1.0
 blade    windows  powershell  yes     2.0.32    1     0.1.0
 air      macos    zsh         no      -         -     -
 ```
@@ -315,9 +331,9 @@ mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--json] <target> -c '
 | Rule | Precedent |
 |---|---|
 | Default: run the exact argv, **no shell**, identical on every OS | `docker exec`, `kubectl exec` |
-| `-c '<string>'`: run the string in the device's own default shell | `sh -c`, `ssh host '…'` |
+| `-c '<string>'`: run the string in the device's shell (§4.2; PowerShell gets `-NoLogo -NoProfile -NonInteractive -Command`, cmd `/d /s /c`) | `sh -c`, `ssh host '…'` |
 | argv[0] `opencode` or `mesh` resolves to that device's install (§6.4) | — |
-| stdin is passed through | `ssh` |
+| stdin is passed through when it's a pipe/file; a terminal sends nothing (use `-t`) | `ssh`, `docker exec` |
 | `-t` allocates a TTY (interactive; e.g. `mesh exec -t blade opencode` = remote TUI) | `ssh -t`, `docker exec -it` |
 | `-w` working dir, `-e` env var | `docker exec -w / -e` |
 | Everything after `<target>` belongs to the command; `--` is optional | `docker exec`, `ssh` |
@@ -325,8 +341,10 @@ mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--json] <target> -c '
 - Single device: output streams live; exit code passed through.
 - Multiple devices: run in parallel. Text output prefixes each line with `device │ `, then a
   summary line (`✓ blade 0 1.2s · ✗ air 1 0.4s · ⨯ vps offline`). `--json` returns results.
-- `--timeout`: enforced **on the remote side** (kills the whole process tree), plus a local
-  backstop. CLI default: none.
+- `--timeout`: enforced **on the remote side** (kills the whole process tree: a job object on
+  Windows, a process group on unix; exit code 124, `error: "timeout after Ns"`), plus a local
+  backstop at timeout + 15 s. CLI default: none.
+- A target naming a device missing from the cache runs one sync first (§5.1).
 - The remote process gets `MESH_FROM=<calling device>`.
 - For long-lived background commands, use opencode's own shells:
   `mesh exec blade opencode api shell.create …` / `shell.output`.
@@ -471,12 +489,15 @@ The first stdin line is a JSON envelope; everything after it is passed to the ch
   shell.
 - stdout/stderr ride SSH's own channels; the exit status is SSH's exit status. No framing.
 - Unknown envelope fields are ignored; a higher major `v` fails with an upgrade message.
-- `-t` mode: same, with `ssh -t`.
+- `-t` mode: `ssh -t … exec self --envelope <hex>`: the envelope travels hex-encoded as an
+  argument (only `[0-9a-f]`, safe in every shell) because stdin is the terminal.
 
 ### 6.3 Remote shell quoting
 
 Never build shell strings from user argv. The only string that crosses a remote shell is the
-quoted absolute mesh path + fixed flags above.
+absolute mesh path + fixed flags above (+ the hex envelope for `-t`). Windows: the path is
+unquoted when it has no spaces, so it runs under any sshd DefaultShell (cmd, powershell, pwsh);
+with spaces it's double-quoted (cmd, the default). Unix: single-quoted.
 
 ### 6.4 Finding opencode on a device (at run time, on that device)
 
@@ -505,6 +526,24 @@ Only `version`, `url`, `pid` are read from `service.json` — never `password`.
 - `-t` interactive sessions keep using plain `ssh -t`. If the mux can't start, fall back to a
   direct one-shot `ssh` (the §6.2 handoff).
 
+Details:
+
+- The mux is the hidden `mesh mux`, spawned detached by the first client (no console, its own
+  process group, out of the caller's job when allowed; logs to `log/mux.log`). Windows pipe:
+  `\\.\pipe\opencode-mesh-<user SID>`, DACL = that user only, remote clients rejected. Unix:
+  `<state>/mux.sock`. Its hello carries a build id; a client from another build tells it to
+  quit and starts its own.
+- The remote side is the hidden `mesh exec self --serve`; links are dialed lazily per device
+  (offline devices fail at once; no hello within 15 s = failed).
+- Frame: `[kind u8][id u32 LE][len u32 LE][len bytes]`. Kinds: `0 hello` (JSON, first frame
+  each way the server speaks), `1 start` (envelope JSON; to the mux it also carries `device`),
+  `2 stdin` (empty = EOF), `3 stdout`, `4 stderr`, `5 exit` (JSON `{code, error?}`), `6 cancel`
+  (kill the tree), `7 quit` (client → mux), `8 ping` (echoed). Stream chunks ≤ 64 KiB. The mux
+  rewrites ids between clients and links; a client that disconnects cancels its commands.
+- Dead links: a link quiet for 20 s is pinged before reuse (one round trip; no answer in 3 s →
+  redial transparently). The mux also pings quiet links and kills one that doesn't answer
+  within 10 s; its in-flight commands end with exit 255 `connection to <device> lost`.
+
 ## 7. Setup details
 
 ### 7.1 SSH server and OS permissions (inside `mesh up`, once)
@@ -513,9 +552,14 @@ Adapt to what exists; never reconfigure an existing server.
 
 | OS | If SSH server missing | Always |
 |---|---|---|
-| Windows | One UAC: install OpenSSH Server capability, start it, set Automatic | Detect default shell (`HKLM\SOFTWARE\OpenSSH\DefaultShell`, else `cmd`); detect effective keys file (parse `sshd_config` incl. `Match Group administrators`) |
+| Windows | One UAC: install OpenSSH Server capability, start it, set Automatic | Pick the `exec -c` shell (§4.2; sshd's DefaultShell is left untouched); detect effective keys file (parse `sshd_config` incl. `Match Group administrators`; membership counts even when not elevated); the one UAC also creates the admin keys file (Administrators + SYSTEM only, no inheritance) and the `keys` task (§7.3) when needed |
 | macOS | Open Sharing settings; user turns on **Remote Login** | Also require **"Allow full disk access for remote users"** (otherwise remote commands can't read `~/Documents`, `~/Desktop`); open the exact pane, wait, re-verify via SSH to self |
 | Linux | One sudo: install via detected package manager | `loginctl enable-linger $USER` (user timers survive logout); detect login shell |
+
+The device's `.host.pub` is read from the server's `ssh_host_ed25519_key.pub`; where that needs
+admin to read (Windows), `up` asks the running server instead (`ssh-keyscan 127.0.0.1`).
+The one elevated step on Windows is `meshw elevated <hex plan>` via a single UAC prompt; if it's
+declined or unanswered `up` exits 3 and prints the exact command to run in an admin terminal.
 
 ### 7.2 Scheduling
 
