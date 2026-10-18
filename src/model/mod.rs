@@ -147,7 +147,7 @@ pub(crate) enum ServiceState {
     Ok,
     /// Not registered (no `service.json`).
     Down,
-    /// Registered and alive, but no HTTP answer within 2 s.
+    /// Registered and alive, but no HTTP answer within 4 s.
     Hung,
     /// `service.json` names a dead pid.
     Stale,

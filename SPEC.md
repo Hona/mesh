@@ -354,10 +354,10 @@ The service state (JSON `opencode.service`) is shown when it isn't `ok`, e.g.
 
 | State | Meaning | Check |
 |---|---|---|
-| `ok` | answers | `GET /api/info` on `service.json`'s url gets any HTTP status (401 too; the password is never read) within 2 s |
+| `ok` | answers | `GET /api/info` on `service.json`'s url gets any HTTP status (401 too; the password is never read) within 4 s |
 | `down` | not running | no `service.json` (stopped cleanly) |
 | `stale` | crashed / killed | `service.json` names a dead pid |
-| `hung` | alive, not answering | pid alive, no HTTP answer within 2 s (connect 1 s) |
+| `hung` | alive, not answering | pid alive, no HTTP answer within 4 s (connect 1 s; a busy service answered in 1.8 s right after MCP restarts, so 2 s was too tight) |
 
 A raw `TcpStream` with timeouts, no `opencode` spawn. `status` never hangs on a broken opencode:
 every opencode spawn mesh makes (version, busy, config, reload, MCP restarts) has a hard limit

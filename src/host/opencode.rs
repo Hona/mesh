@@ -42,9 +42,9 @@ fn service() -> Option<Service> {
     })
 }
 
-/// Does the service's HTTP server answer `GET /api/info` within ~2 s? Any HTTP status counts
+/// Does the service's HTTP server answer `GET /api/info` within 4 s? Any HTTP status counts
 /// (it may want auth; the password is never read). A suspended or wedged server accepts the
-/// connection but never answers.
+/// connection but never answers; a busy one can take ~2 s (seen right after MCP restarts).
 fn answers(url: &str) -> bool {
     use std::io::{Read, Write};
     use std::net::{TcpStream, ToSocketAddrs};
@@ -60,7 +60,7 @@ fn answers(url: &str) -> bool {
     let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(1)) else {
         return false;
     };
-    let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = s.set_read_timeout(Some(Duration::from_secs(4)));
     let _ = s.set_write_timeout(Some(Duration::from_secs(1)));
     let req = format!("GET /api/info HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     let mut head = [0u8; 5];
