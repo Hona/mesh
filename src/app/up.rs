@@ -351,7 +351,7 @@ pub(crate) fn run(o: &Opts, ui: &Ui) -> R<i32> {
     if o.skip.iter().any(|s| s == "mcp") {
         up.info("mcp", "skipped");
     } else {
-        up.mcp(&inst.mesh);
+        up.mcp(&inst.mesh, inst.changed);
     }
     if o.skip.iter().any(|s| s == "schedule") {
         up.info("schedule", "skipped");
@@ -686,9 +686,28 @@ impl Up<'_> {
         Ok(true)
     }
 
-    fn mcp(&mut self, mesh: &Path) {
+    /// Register the MCP server; when the binary was just replaced, restart the running ones so
+    /// opencode isn't left talking to old code.
+    fn mcp(&mut self, mesh: &Path, replaced: bool) {
         let want = vec![mesh.display().to_string(), "mcp".to_string()];
+        let restart = |up: &Self, what: &str| {
+            if up.o.check {
+                return up.ok("mcp", format!("{what} · would restart it in opencode"));
+            }
+            match opencode::reconnect_mcp("mesh") {
+                Ok(0) => up.ok("mcp", what),
+                Ok(n) => up.ok(
+                    "mcp",
+                    format!("{what} · restarted on the new binary ({n} opencode locations)"),
+                ),
+                Err(e) => up.warn(
+                    "mcp",
+                    format!("{what}, but restarting it failed ({e}): run `opencode reload`"),
+                ),
+            }
+        };
         match opencode::mcp_entry("mesh") {
+            Ok(Some(cmd)) if cmd == want && replaced => restart(self, "\"mesh\" registered"),
             Ok(Some(cmd)) if cmd == want => self.ok("mcp", "\"mesh\" registered"),
             Ok(existing) => {
                 if let Some(other) = existing {
@@ -707,7 +726,7 @@ impl Up<'_> {
                 match opencode::mcp_add("mesh", &[&want[0], "mcp"]) {
                     Ok(()) => {
                         let _ = opencode::reload();
-                        self.ok("mcp", "registered \"mesh\"");
+                        restart(self, "registered \"mesh\"");
                     }
                     Err(e) => self.fail("mcp", e),
                 }

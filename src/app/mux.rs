@@ -9,7 +9,7 @@ use std::time::Duration;
 
 pub(crate) fn run() -> R<i32> {
     process::set_background();
-    let listener = ipc::bind().map_err(|e| Fail(1, format!("mux: {e}")))?;
+    let listener = ipc::bind(exec::BUILD).map_err(|e| Fail(1, format!("mux: {e}")))?;
     eprintln!(
         "mux {VERSION} build {} pid {}",
         exec::BUILD,

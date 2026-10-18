@@ -10,7 +10,6 @@ pub(crate) const STDOUT: u8 = 3;
 pub(crate) const STDERR: u8 = 4;
 pub(crate) const EXIT: u8 = 5;
 pub(crate) const CANCEL: u8 = 6;
-pub(crate) const QUIT: u8 = 7;
 pub(crate) const PING: u8 = 8;
 
 /// Largest payload accepted; senders chunk stream data well below this.

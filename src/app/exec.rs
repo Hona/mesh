@@ -51,27 +51,19 @@ pub(crate) fn hello() -> Vec<u8> {
     format!(r#"{{"v":1,"mesh":"{VERSION}","build":"{BUILD}"}}"#).into_bytes()
 }
 
-/// A mux of this build: connect, or replace one from another build, or start one.
+/// This build's mux: each build has its own endpoint, so builds never fight over one.
 fn mux_client() -> Option<mux::Client> {
-    if let Some(c) = mux::Client::connect() {
-        if c.hello == hello() {
-            return Some(c);
-        }
-        c.quit();
-        for _ in 0..50 {
-            std::thread::sleep(Duration::from_millis(10));
-            if mux::Client::connect().is_none() {
-                break;
-            }
-        }
+    let connect = || mux::Client::connect(BUILD).filter(|c| c.hello == hello());
+    if let Some(c) = connect() {
+        return Some(c);
     }
     let exe = std::env::current_exe().ok()?;
     let log = store::log_file("mux", &format!("start {}", exe.display()))?;
     process::spawn_detached(&exe, &["mux"], log).ok()?;
     for _ in 0..300 {
         std::thread::sleep(Duration::from_millis(5));
-        if let Some(c) = mux::Client::connect() {
-            return (c.hello == hello()).then_some(c);
+        if let Some(c) = connect() {
+            return Some(c);
         }
     }
     None

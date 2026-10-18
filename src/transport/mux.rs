@@ -2,7 +2,7 @@
 //! every local mesh process over the local socket. Frames from clients are routed to the
 //! device link with the ids rewritten; replies are routed back.
 
-use super::frame::{self, CANCEL, EXIT, HELLO, PING, QUIT, START, STDERR, STDIN, STDOUT};
+use super::frame::{self, CANCEL, EXIT, HELLO, PING, START, STDERR, STDIN, STDOUT};
 use crate::host::ipc::{self, Conn};
 use crate::model::{Envelope, ExitInfo};
 use std::collections::HashMap;
@@ -290,7 +290,6 @@ impl Mux {
                         let _ = link.send(f.kind, *rid, &f.data);
                     }
                 }
-                QUIT => std::process::exit(0),
                 _ => {}
             }
         }
@@ -341,9 +340,9 @@ pub(crate) struct Client {
 }
 
 impl Client {
-    /// Connect to a running mux; None if there is none.
-    pub(crate) fn connect() -> Option<Client> {
-        let conn = Arc::new(ipc::connect().ok()??);
+    /// Connect to the running mux of build `tag`; None if there is none.
+    pub(crate) fn connect(tag: &str) -> Option<Client> {
+        let conn = Arc::new(ipc::connect(tag).ok()??);
         let f = frame::read(&mut &*conn).ok()??;
         (f.kind == HELLO).then(|| Client {
             conn,
@@ -355,11 +354,6 @@ impl Client {
     pub(crate) fn send(&self, kind: u8, id: u32, data: &[u8]) -> io::Result<()> {
         let _g = lock(&self.w);
         frame::write(&mut &*self.conn, kind, id, data)
-    }
-
-    /// Ask this mux to exit (it's from another build).
-    pub(crate) fn quit(&self) {
-        let _ = self.send(QUIT, 0, &[]);
     }
 
     /// Frames from the mux; read from one thread only.

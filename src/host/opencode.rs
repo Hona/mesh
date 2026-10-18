@@ -219,6 +219,59 @@ pub(crate) fn mcp_add(name: &str, command: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
+/// Restart MCP server `name` in every loaded opencode location so a replaced binary is used.
+/// Returns how many locations were reconnected (0 if the service isn't running).
+pub(crate) fn reconnect_mcp(name: &str) -> Result<usize, String> {
+    let svc = service();
+    if !svc.as_ref().is_some_and(|s| s.exe.is_some()) {
+        return Ok(0);
+    }
+    let (bin, _) = find(svc.as_ref()).ok_or("opencode not found")?;
+    let out = process::command(&bin)
+        .args(["api", "debug.location.list"])
+        .output()
+        .map_err(|e| e.to_string())?;
+    let locations: Vec<String> = serde_json::from_slice::<serde_json::Value>(&out.stdout)
+        .ok()
+        .and_then(|v| {
+            v.as_array().map(|a| {
+                a.iter()
+                    .filter_map(|l| l["directory"].as_str().map(String::from))
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+    if locations.is_empty() {
+        return reload().map(usize::from);
+    }
+    let server = format!("server={name}");
+    let reconnected = std::thread::scope(|s| {
+        let handles: Vec<_> = locations
+            .iter()
+            .map(|loc| {
+                let (bin, server) = (&bin, &server);
+                s.spawn(move || {
+                    let loc = format!("location[directory]={loc}");
+                    ["experimental.mcp.disconnect", "experimental.mcp.connect"]
+                        .iter()
+                        .all(|op| {
+                            process::command(bin)
+                                .args(["api", op, "--param", server, "--param", &loc])
+                                .output()
+                                .is_ok_and(|o| o.status.success())
+                        })
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or(false))
+            .filter(|ok| *ok)
+            .count()
+    });
+    Ok(reconnected)
+}
+
 /// `opencode reload` if the service is running. Ok(false) if it isn't.
 pub(crate) fn reload() -> Result<bool, String> {
     let svc = service();

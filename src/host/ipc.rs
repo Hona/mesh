@@ -1,4 +1,4 @@
-//! Per-user local socket between mesh processes and the mux (SPEC §6.5):
+//! Per-user, per-build local socket between mesh processes and the mux (SPEC §6.5):
 //! a named pipe on Windows (current user only, no remote clients), a unix socket elsewhere.
 //! `&Conn` implements Read + Write and can be used from several threads at once.
 
@@ -74,9 +74,9 @@ mod imp {
     const IO_PENDING: u32 = 997;
     const OVERLAPPED_FLAG: u32 = 0x4000_0000;
 
-    fn name() -> io::Result<Vec<u16>> {
+    fn name(tag: &str) -> io::Result<Vec<u16>> {
         let sid = win::user_sid().ok_or_else(|| io::Error::other("no user SID"))?;
-        Ok(win::wide(format!(r"\\.\pipe\opencode-mesh-{sid}")))
+        Ok(win::wide(format!(r"\\.\pipe\opencode-mesh-{sid}-{tag}")))
     }
 
     // One event per thread, reused for every overlapped call made on that thread.
@@ -201,8 +201,8 @@ mod imp {
     }
 
     /// Claim the pipe name (fails if a mux already runs for this user).
-    pub(crate) fn bind() -> io::Result<Listener> {
-        let name = name()?;
+    pub(crate) fn bind(tag: &str) -> io::Result<Listener> {
+        let name = name(tag)?;
         let sid = win::user_sid().unwrap_or_default();
         let sddl = win::wide(format!("D:P(A;;GA;;;{sid})"));
         let mut sd = std::ptr::null_mut();
@@ -233,8 +233,8 @@ mod imp {
     }
 
     /// Connect to the running mux; None if there isn't one.
-    pub(crate) fn connect() -> io::Result<Option<Conn>> {
-        let name = name()?;
+    pub(crate) fn connect(tag: &str) -> io::Result<Option<Conn>> {
+        let name = name(tag)?;
         for _ in 0..20 {
             // GENERIC_READ|WRITE, OPEN_EXISTING, overlapped, identify-only impersonation
             let flags = OVERLAPPED_FLAG | 0x0010_0000 | 0x0001_0000;
@@ -270,8 +270,8 @@ mod imp {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
 
-    fn path() -> PathBuf {
-        super::super::paths::state_dir().join("mux.sock")
+    fn path(tag: &str) -> PathBuf {
+        super::super::paths::state_dir().join(format!("mux-{tag}.sock"))
     }
 
     pub(crate) struct Conn(UnixStream);
@@ -299,9 +299,9 @@ mod imp {
         }
     }
 
-    pub(crate) fn bind() -> io::Result<Listener> {
+    pub(crate) fn bind(tag: &str) -> io::Result<Listener> {
         use std::os::unix::fs::PermissionsExt;
-        let p = path();
+        let p = path(tag);
         if let Some(dir) = p.parent() {
             std::fs::create_dir_all(dir)?;
             std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
@@ -316,8 +316,8 @@ mod imp {
         UnixListener::bind(&p).map(Listener)
     }
 
-    pub(crate) fn connect() -> io::Result<Option<Conn>> {
-        match UnixStream::connect(path()) {
+    pub(crate) fn connect(tag: &str) -> io::Result<Option<Conn>> {
+        match UnixStream::connect(path(tag)) {
             Ok(s) => Ok(Some(Conn(s))),
             Err(e)
                 if matches!(
