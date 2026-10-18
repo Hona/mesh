@@ -213,10 +213,11 @@ impl Mux {
                 EXIT => lock(&link.routes).remove(&f.id),
                 _ => None,
             };
+            // Only output for a client is activity; ping replies must not keep the mux alive.
             if let Some((peer, id)) = route {
                 let _ = peer.send(f.kind, id, &f.data);
+                self.touch();
             }
-            self.touch();
         }
         link.alive.store(false, Ordering::Relaxed);
         {

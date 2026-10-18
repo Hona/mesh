@@ -2,7 +2,7 @@
 //! SSH handoff (§6.2). Callers get a stream of events and render them.
 
 use super::{Fail, R, VERSION, serve, store, sync};
-use crate::host::{install, process};
+use crate::host::{install, ipc, process};
 use crate::model::{Device, Envelope, ExecResult, ExitInfo, Target};
 use crate::network;
 use crate::transport::frame::{CANCEL, EXIT, START, STDERR, STDIN, STDOUT};
@@ -57,6 +57,7 @@ fn mux_client() -> Option<mux::Client> {
     if let Some(c) = connect() {
         return Some(c);
     }
+    quit_old_muxes();
     let exe = install::installed_copy().or_else(|| std::env::current_exe().ok())?;
     let log = store::log_file("mux", &format!("start {}", exe.display()))?;
     process::spawn_detached(&exe, &["mux"], log).ok()?;
@@ -74,6 +75,25 @@ pub(crate) fn stop_mux() {
     if let Some(c) = mux::Client::connect(BUILD) {
         c.quit();
     }
+}
+
+/// Ask muxes of older builds to exit: new clients can't reach them, so they'd only hold links,
+/// remote serve processes and their (renamed-aside) exe. Newer builds' muxes are left alone, so
+/// a stale old client can never knock out a newer mux. Ok(how many were asked).
+pub(crate) fn quit_old_muxes() -> usize {
+    let build = |hello: &[u8]| {
+        let v: serde_json::Value = serde_json::from_slice(hello).unwrap_or_default();
+        u128::from_str_radix(v["build"].as_str().unwrap_or("0"), 16).unwrap_or(0)
+    };
+    let mine = u128::from_str_radix(BUILD, 16).unwrap_or(0);
+    let mut asked = 0;
+    for tag in ipc::endpoints().into_iter().filter(|t| t != BUILD) {
+        if let Some(c) = mux::Client::connect(&tag).filter(|c| build(&c.hello) < mine) {
+            c.quit();
+            asked += 1;
+        }
+    }
+    asked
 }
 
 /// Feed `input` to `sink` on its own thread; an empty chunk means EOF.

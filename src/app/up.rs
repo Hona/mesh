@@ -178,6 +178,9 @@ pub(crate) fn run(o: &Opts, ui: &Ui) -> R<i32> {
 
     // Preflight first: it decides the default repo and device name for the header.
     let inst = install::install(check)?;
+    if inst.changed && !check {
+        exec::quit_old_muxes();
+    }
     let path_added = install::ensure_user_path(&install::dir(), check)?;
     let login = registry::login().map_err(|e| Fail(3, e))?;
     let (oc_version, oc_pid) = opencode::installed().ok_or_else(|| {

@@ -158,7 +158,9 @@ pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
             .map_err(|e| format!("{}: {e}", mesh.display()))?;
         return Ok(status.code().unwrap_or(1));
     }
-    if !o.resume {
+    if o.resume {
+        exec::quit_old_muxes();
+    } else {
         say("ok", "binary", format!("already {VERSION}"));
     }
     let mut failed = false;

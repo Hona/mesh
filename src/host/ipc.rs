@@ -2,7 +2,7 @@
 //! a named pipe on Windows (current user only, no remote clients), a unix socket elsewhere.
 //! `&Conn` implements Read + Write and can be used from several threads at once.
 
-pub(crate) use imp::{Conn, Listener, bind, connect};
+pub(crate) use imp::{Conn, Listener, bind, connect, endpoints};
 
 #[cfg(windows)]
 mod imp {
@@ -60,6 +60,54 @@ mod imp {
         ) -> i32;
         fn GetOverlappedResult(h: Handle, ov: *mut Overlapped, n: *mut u32, wait: i32) -> i32;
         fn CreateEventW(sa: *mut c_void, manual: i32, initial: i32, name: *const u16) -> Handle;
+        fn FindFirstFileW(name: *const u16, data: *mut FindData) -> Handle;
+        fn FindNextFileW(h: Handle, data: *mut FindData) -> i32;
+        fn FindClose(h: Handle) -> i32;
+    }
+
+    /// WIN32_FIND_DATAW
+    #[repr(C)]
+    struct FindData {
+        attrs: u32,
+        times: [u32; 6],
+        size: [u32; 2],
+        reserved: [u32; 2],
+        name: [u16; 260],
+        alt: [u16; 14],
+    }
+
+    /// Build tags of this user's running muxes ("" = from before per-build names).
+    pub(crate) fn endpoints() -> Vec<String> {
+        let Some(sid) = win::user_sid() else {
+            return Vec::new();
+        };
+        let prefix = format!("opencode-mesh-{sid}");
+        let mut out = Vec::new();
+        let mut fd: FindData = unsafe { std::mem::zeroed() };
+        let h = unsafe { FindFirstFileW(win::wide(r"\\.\pipe\*").as_ptr(), &mut fd) };
+        if h as isize == -1 {
+            return out;
+        }
+        loop {
+            let end = fd
+                .name
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(fd.name.len());
+            let name = String::from_utf16_lossy(&fd.name[..end]);
+            match name.strip_prefix(&prefix) {
+                Some("") => out.push(String::new()),
+                Some(rest) if rest.starts_with('-') => out.push(rest[1..].to_string()),
+                _ => {}
+            }
+            if unsafe { FindNextFileW(h, &mut fd) } == 0 {
+                break;
+            }
+        }
+        unsafe { FindClose(h) };
+        out.sort();
+        out.dedup();
+        out
     }
     #[link(name = "advapi32")]
     unsafe extern "system" {
@@ -76,7 +124,12 @@ mod imp {
 
     fn name(tag: &str) -> io::Result<Vec<u16>> {
         let sid = win::user_sid().ok_or_else(|| io::Error::other("no user SID"))?;
-        Ok(win::wide(format!(r"\\.\pipe\opencode-mesh-{sid}-{tag}")))
+        let suffix = if tag.is_empty() {
+            String::new()
+        } else {
+            format!("-{tag}")
+        };
+        Ok(win::wide(format!(r"\\.\pipe\opencode-mesh-{sid}{suffix}")))
     }
 
     // One event per thread, reused for every overlapped call made on that thread.
@@ -271,7 +324,31 @@ mod imp {
     use std::path::PathBuf;
 
     fn path(tag: &str) -> PathBuf {
-        super::super::paths::state_dir().join(format!("mux-{tag}.sock"))
+        let name = if tag.is_empty() {
+            "mux.sock".to_string()
+        } else {
+            format!("mux-{tag}.sock")
+        };
+        super::super::paths::state_dir().join(name)
+    }
+
+    /// Build tags of this user's mux sockets ("" = from before per-build names).
+    pub(crate) fn endpoints() -> Vec<String> {
+        let dir = super::super::paths::state_dir();
+        std::fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                let stem = n.strip_suffix(".sock")?;
+                if stem == "mux" {
+                    Some(String::new())
+                } else {
+                    stem.strip_prefix("mux-").map(String::from)
+                }
+            })
+            .collect()
     }
 
     pub(crate) struct Conn(UnixStream);
