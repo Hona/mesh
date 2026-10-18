@@ -807,7 +807,10 @@ Text rendering for the model:
   `strip = true`. Targets: < ~1 MB binary, ~1–2 MB idle RSS for `mesh mcp`.
 - CI (`release.yml`): on a `v*` tag, fail unless it matches the `Cargo.toml` version, build
   all targets (Linux musl via cargo-zigbuild, both macOS on one runner, both Windows MSVC),
-  write `SHA256SUMS`, publish the release (prerelease when the tag has a `-`). **No test steps.**
+  write `SHA256SUMS`, publish the release (prerelease when the tag has a `-`; if a release for
+  the tag already exists, its assets are replaced with `--clobber`). **No test steps.**
+  Releases come only from CI: bump `Cargo.toml`, push the tag, wait for the run
+  (`gh run watch`), then `mesh update`. The pin always names a CI-built release.
 - Install, macOS/Linux:
   `gh api repos/Hona/mesh/contents/install.sh -H "Accept: application/vnd.github.raw" | sh`
 - Install, Windows:
