@@ -230,7 +230,8 @@ first, then fail if still unknown.
 
 ### 5.3 `mesh up`
 
-Create a mesh or join this device to one. Idempotent; re-running is also the repair command.
+Create a mesh or join this device to one. Idempotent; re-running is also the repair command, so
+a joined device keeps its mesh and name unless `--repo` / `--name` change them.
 
 ```
 mesh up [--repo <owner/name>] [--path <dir>] [--name <device>] [--public]
@@ -239,9 +240,9 @@ mesh up [--repo <owner/name>] [--path <dir>] [--name <device>] [--public]
 
 | Flag | |
 |---|---|
-| `--repo` | mesh repo; default `<gh-user>/opencode-mesh`; created if missing |
-| `--path` | subfolder within the repo |
-| `--name` | device name; default Tailscale short name |
+| `--repo` | mesh repo; default: the mesh this device is in, else `<gh-user>/opencode-mesh`; created if missing |
+| `--path` | subfolder within the repo; default: the joined mesh's when `--repo` isn't given |
+| `--name` | device name; default: this device's mesh name, else the Tailscale short name |
 | `--public` | create the repo public (default private) |
 | `--yes` | non-interactive (agents/scripts); `AGENTS.md` defaults to `--prefer mesh`, local skills stay local |
 | `--prefer` | `AGENTS.md` only: `mesh` (keep mesh, back up local) or `local` (upload local). Never uploads skills |

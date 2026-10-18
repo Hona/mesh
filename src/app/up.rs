@@ -232,11 +232,20 @@ pub(crate) fn run(o: &Opts, ui: &Ui) -> R<i32> {
         ));
     }
     ssh::tools().map_err(|e| Fail(3, e))?;
-    let repo = o
-        .repo
+    // Re-running `up` is the repair command: a joined device stays in its mesh, under its name,
+    // unless --repo / --name say otherwise.
+    let joined = store::read_state().ok();
+    let (repo, path) = match (&o.repo, &joined) {
+        (Some(r), _) => (r.clone(), o.path.clone()),
+        (None, Some(j)) if o.path.is_empty() => (j.registry.repo.clone(), j.registry.path.clone()),
+        (None, Some(j)) => (j.registry.repo.clone(), o.path.clone()),
+        (None, None) => (format!("{login}/opencode-mesh"), o.path.clone()),
+    };
+    let name = o
+        .name
         .clone()
-        .unwrap_or_else(|| format!("{login}/opencode-mesh"));
-    let name = o.name.clone().unwrap_or_else(|| host.to_lowercase());
+        .or_else(|| joined.map(|j| j.device))
+        .unwrap_or_else(|| host.to_lowercase());
     if !valid_name(&name) {
         return Err(Fail(
             2,
@@ -278,7 +287,7 @@ pub(crate) fn run(o: &Opts, ui: &Ui) -> R<i32> {
     let mut cfg = RegistryConfig {
         kind: "github".into(),
         repo: repo.clone(),
-        path: o.path.trim_matches('/').into(),
+        path: path.trim_matches('/').into(),
         branch: "main".into(),
     };
     let new_repo = match registry::open(&cfg)
@@ -321,10 +330,10 @@ pub(crate) fn run(o: &Opts, ui: &Ui) -> R<i32> {
     if !check {
         store::write_state(&state)?;
     }
-    let where_ = if o.path.is_empty() {
+    let where_ = if path.is_empty() {
         repo.clone()
     } else {
-        format!("{repo}/{}", o.path.trim_matches('/'))
+        format!("{repo}/{}", path.trim_matches('/'))
     };
     let index = match if new_repo && check {
         None
