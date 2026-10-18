@@ -168,6 +168,8 @@ fn keys(devices: &[Device], r: &mut SyncReport) {
     match transport::authorize(devices) {
         Ok(true) => r.applied.push("keys".into()),
         Ok(false) => {}
+        // The admin keys file is the elevated keys task's job (SPEC §7.3), not a problem here.
+        Err(e) if e.contains("needs admin") => vlog!("authorized keys: {e}"),
         Err(e) => r.warnings.push(format!("authorized keys skipped: {e}")),
     }
 }
