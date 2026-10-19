@@ -37,7 +37,7 @@ mod imp {
             out_size: u32,
             in_size: u32,
             timeout: u32,
-            sa: *mut SecurityAttributes,
+            sa: *mut c_void,
         ) -> Handle;
         fn ConnectNamedPipe(h: Handle, ov: *mut Overlapped) -> i32;
         fn WaitNamedPipeW(name: *const u16, ms: u32) -> i32;
@@ -217,7 +217,7 @@ mod imp {
             const FIRST: u32 = 0x0008_0000;
             const REJECT_REMOTE: u32 = 0x8;
             let open = 0x3 | OVERLAPPED_FLAG | if first { FIRST } else { 0 };
-            let sa = &self.sa as *const SecurityAttributes as *mut SecurityAttributes;
+            let sa = &self.sa as *const SecurityAttributes as *mut c_void;
             let h = unsafe {
                 CreateNamedPipeW(
                     self.name.as_ptr(),

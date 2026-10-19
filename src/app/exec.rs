@@ -7,7 +7,7 @@ use crate::model::{Device, Envelope, ExecResult, ExitInfo, Target};
 use crate::network;
 use crate::transport::frame::{CANCEL, EXIT, START, STDERR, STDIN, STDOUT};
 use crate::transport::{mux, ssh};
-use std::io::{IsTerminal, Read, Write};
+use std::io::{Read, Write};
 use std::process::{ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
@@ -102,7 +102,7 @@ fn feed(input: Input, sink: impl Fn(&[u8]) + Send + 'static) {
     std::thread::spawn(move || {
         match input {
             Input::Bytes(b) => b.chunks(64 << 10).for_each(&sink),
-            Input::Inherit if !std::io::stdin().is_terminal() => {
+            Input::Inherit if process::stdin_streams() => {
                 let mut stdin = std::io::stdin().lock();
                 let mut buf = vec![0u8; 64 << 10];
                 while let Ok(n @ 1..) = stdin.read(&mut buf) {
@@ -361,6 +361,15 @@ pub(crate) fn run(
 ) {
     let n = devices.len();
     let start = Instant::now();
+    // Nothing to stream: the command's stdin is the null device, so it sees EOF at once.
+    let env = &Envelope {
+        stdin: match input {
+            Input::Inherit => process::stdin_streams(),
+            Input::Bytes(_) => true,
+            Input::Empty => false,
+        },
+        ..env.clone()
+    };
     let (tx, rx) = mpsc::channel();
     let client = match (!nested()).then(mux_client).flatten() {
         Some(c) => Some(via_mux(c, me, devices, env, input, tx)),
@@ -419,6 +428,7 @@ pub(crate) fn interactive(me: &str, d: &Device, env: &Envelope) -> R<i32> {
         v: 1,
         from: me.to_string(),
         tty: true,
+        stall: false, // a terminal session waits for its user
         ..env.clone()
     };
     let hex = serve::hex(&serde_json::to_vec(&e).unwrap_or_default());
@@ -462,18 +472,54 @@ impl Cap {
         let kept = self.head.len() + self.tail.len();
         if self.total <= self.half.saturating_mul(2) && kept == self.total {
             self.head.extend_from_slice(&self.tail);
-            return (String::from_utf8_lossy(&self.head).into_owned(), false);
+            return (plain(&self.head), false);
         }
         let cut = self.tail.len().saturating_sub(self.half);
         let tail = &self.tail[cut..];
         let dropped = self.total - self.head.len() - tail.len();
         let text = format!(
             "{}\n…[{dropped} bytes truncated]…\n{}",
-            String::from_utf8_lossy(&self.head),
-            String::from_utf8_lossy(tail)
+            plain(&self.head),
+            plain(tail)
         );
         (text, true)
     }
+}
+
+/// Captured output as text for agents: ANSI escape sequences removed, CRLF → LF.
+fn plain(b: &[u8]) -> String {
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], b.get(i + 1)) {
+            // CSI: ESC [ params… final byte 0x40–0x7E
+            (0x1b, Some(b'[')) => {
+                i += 2;
+                while i < b.len() && !(0x40..=0x7e).contains(&b[i]) {
+                    i += 1;
+                }
+                i += 1;
+            }
+            // OSC (titles, links): ESC ] … BEL or ESC \
+            (0x1b, Some(b']')) => {
+                i += 2;
+                while i < b.len() && b[i] != 0x07 && !(b[i] == 0x1b && b.get(i + 1) == Some(&b'\\'))
+                {
+                    i += 1;
+                }
+                i += if b.get(i) == Some(&0x1b) { 2 } else { 1 };
+            }
+            // charset designation (`tput sgr0` sends ESC ( B), then other two-byte sequences
+            (0x1b, Some(b'(' | b')')) => i += 3,
+            (0x1b, Some(_)) => i += 2,
+            (b'\r', Some(b'\n')) => i += 1,
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Run and collect results (CLI `--json`, MCP `exec`, status probes).
@@ -510,6 +556,9 @@ pub(crate) fn capture(
             r.exit = None;
             r.ms = None;
             continue;
+        }
+        if r.error.as_deref() == Some(serve::STALLED) {
+            r.hint = Some(serve::STALL_HINT.into());
         }
         let ((so, t1), (se, t2)) = (out.finish(), err.finish());
         r.stdout = Some(so);

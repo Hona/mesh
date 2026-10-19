@@ -85,7 +85,7 @@ fn tools() -> Value {
         },
         {
             "name": "exec",
-            "description": "Run a command on mesh devices. argv runs the exact program with no shell; command runs a string in the device's own shell. argv[0] \"opencode\" or \"mesh\" resolves to that device's install.",
+            "description": "Run a command on mesh devices. Give one of: argv runs the exact program with no shell; command runs a one-line string in the device's own shell; script runs a multi-line script in the device's own shell, no quoting needed. argv[0] \"opencode\" or \"mesh\" resolves to that device's install.",
             "inputSchema": {
                 "type": "object",
                 "required": ["target"],
@@ -93,7 +93,9 @@ fn tools() -> Value {
                     "target": { "type": "string", "description": "name, a,b, all, self, os:linux|macos|windows" },
                     "argv": { "type": "array", "items": { "type": "string" } },
                     "command": { "type": "string" },
-                    "stdin": { "type": "string" },
+                    "script": { "type": "string", "description": "multi-line script for the device's shell (see status: pwsh, bash, …)" },
+                    "stdin": { "type": "string", "description": "without it, the command's stdin is empty" },
+                    "stall": { "type": "boolean", "default": true, "description": "end the command when it has no output and an idle process tree for 20 s; false for commands that wait quietly" },
                     "cwd": { "type": "string" },
                     "env": { "type": "object", "additionalProperties": { "type": "string" } },
                     "timeout": { "type": "number", "default": 120, "description": "seconds; kills the whole process tree" },
@@ -138,12 +140,22 @@ fn exec_tool(a: &Value) -> Result<(String, Value), String> {
             .collect()
     });
     let command = a["command"].as_str().map(String::from);
-    if argv.is_some() == command.is_some() || argv.as_ref().is_some_and(Vec::is_empty) {
-        return Err("give exactly one of argv (non-empty) or command".into());
+    let script = a["script"].as_str().map(String::from);
+    let given = [argv.is_some(), command.is_some(), script.is_some()];
+    if given.iter().filter(|g| **g).count() != 1 || argv.as_ref().is_some_and(Vec::is_empty) {
+        return Err("give exactly one of argv (non-empty), command or script".into());
+    }
+    if script.is_some() && a["stdin"].is_string() {
+        return Err(
+            "script can't be combined with stdin: the script is fed to the shell through stdin"
+                .into(),
+        );
     }
     let env = Envelope {
         argv,
         command,
+        script,
+        stall: a["stall"].as_bool().unwrap_or(true),
         cwd: a["cwd"].as_str().map(String::from),
         env: a["env"]
             .as_object()

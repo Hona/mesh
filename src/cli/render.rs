@@ -1,6 +1,7 @@
 //! Text and JSON output (shared by the CLI and the MCP server).
 
 use crate::app::exec::{self, Event, Input};
+use crate::app::serve;
 use crate::model::{Device, Envelope, ExecResult, ServiceState, Status, Step, SyncReport};
 use serde::Serialize;
 use std::io::Write;
@@ -162,6 +163,9 @@ pub(crate) fn exec_text(results: &[ExecResult]) -> String {
         }
         t += &head;
         t.push('\n');
+        if let Some(h) = &r.hint {
+            t += &format!("({h})\n");
+        }
         for (label, s) in [("", &r.stdout), ("stderr:\n", &r.stderr)] {
             if let Some(s) = s.as_deref().filter(|s| !s.is_empty()) {
                 t += label;
@@ -177,11 +181,11 @@ pub(crate) fn exec_text(results: &[ExecResult]) -> String {
 
 /// Live exec output: one device streams raw (exit code passed through); several get
 /// `device │ ` line prefixes and a summary line (SPEC §5.5).
-pub(crate) fn exec_live(me: &str, devices: &[Device], env: &Envelope) -> i32 {
+pub(crate) fn exec_live(me: &str, devices: &[Device], env: &Envelope, input: Input) -> i32 {
     if let [d] = devices {
         let mut code = 255;
         let mut so = std::io::stdout().lock();
-        exec::run(me, devices, env, Input::Inherit, &mut |ev| match ev {
+        exec::run(me, devices, env, input, &mut |ev| match ev {
             Event::Out(_, b) => {
                 let _ = so.write_all(&b);
                 let _ = so.flush();
@@ -192,7 +196,11 @@ pub(crate) fn exec_live(me: &str, devices: &[Device], env: &Envelope) -> i32 {
             Event::Exit(_, info, _) => {
                 if let Some(e) = info.error {
                     let _ = so.flush();
-                    eprintln!("mesh: {}: {e}", d.name);
+                    if e == serve::STALLED {
+                        eprintln!("mesh: {}: {e}: {}", d.name, serve::STALL_HINT);
+                    } else {
+                        eprintln!("mesh: {}: {e}", d.name);
+                    }
                 }
                 code = info.code.unwrap_or(255);
             }
@@ -220,7 +228,7 @@ pub(crate) fn exec_live(me: &str, devices: &[Device], env: &Envelope) -> i32 {
             let _ = std::io::stdout().write_all(&v);
         }
     };
-    exec::run(me, devices, env, Input::Inherit, &mut |ev| match ev {
+    exec::run(me, devices, env, input, &mut |ev| match ev {
         Event::Out(i, b) => lines(&mut bufs[i][0], &b, &prefix[i], false, &emit),
         Event::Err(i, b) => lines(&mut bufs[i][1], &b, &prefix[i], true, &emit),
         Event::Exit(i, info, ms) => {

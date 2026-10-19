@@ -376,16 +376,18 @@ for a few seconds right after MCP restarts).
 Run a command on devices.
 
 ```
-mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--durable] [--json] <target> <cmd> [args…]
-mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--durable] [--json] <target> -c '<string>'
+mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--durable] [--no-stall] [--json] <target> <cmd> [args…]
+mesh exec [flags] <target> -c '<string>'
+mesh exec [flags] <target> -s            # script on stdin
 ```
 
 | Rule | Precedent |
 |---|---|
 | Default: run the exact argv, **no shell**, identical on every OS | `docker exec`, `kubectl exec` |
 | `-c '<string>'`: run the string in the device's shell (§4.2; PowerShell gets `-NoLogo -NoProfile -NonInteractive -Command`, cmd `/d /s /c`) | `sh -c`, `ssh host '…'` |
+| `-s`: read a script from stdin and run it in the device's shell, no quoting: unix shells get it on stdin (`-s`; fish none); PowerShell a temp `.ps1` (UTF-8 BOM) with `-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File`, cmd a temp `.cmd` (`@echo off`, CRLF) with `/d /c`, both in `<state>/run/`, deleted when it ends. (`-Command -` reads stdin line by line like a prompt: an `else` on its own line silently ends the script.) | `bash -s`, `ssh host 'bash -s' < x` |
 | argv[0] `opencode` or `mesh` resolves to that device's install (§6.4) | — |
-| stdin is passed through when it's a pipe/file; a terminal sends nothing (use `-t`) | `ssh`, `docker exec` |
+| stdin is passed through when it's a pipe/file; otherwise (terminal, null device, closed) the command's stdin is the null device, so it sees EOF at once (use `-t` for a terminal) | `ssh -n`, `docker exec` |
 | `-t` allocates a TTY (interactive; e.g. `mesh exec -t blade opencode` = remote TUI) | `ssh -t`, `docker exec -it` |
 | `-w` working dir, `-e` env var | `docker exec -w / -e` |
 | Everything after `<target>` belongs to the command; `--` is optional | `docker exec`, `ssh` |
@@ -409,8 +411,21 @@ mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--durable] [--json] <
   `systemd-run --user --scope` when the user bus is up (out of the login session logind may
   reap; linger keeps the user manager; verified on the Debian VPS: the process lands in
   `user@0.service/app.slice/run-*.scope`). macOS: runs as is. `opencode service start|restart`
-  is always durable. Also the fix for network clients that stall inside a Windows SSH session
-  (e.g. `ssh` to a third host hangs mid-handshake; durable: 0.7 s); the skill says so.
+  is always durable.
+- **Stall**: a command with no output whose process tree has used < 1% CPU and done no I/O for
+  20 s (sampled every 5 s: job accounting on Windows, the process group's `/proc` stat + io on
+  Linux; macOS: not detected) is killed: exit 124, `error: "stalled"`, `hint: "no output and
+  idle for 20 s; is it waiting for input?"`, the output so far; the CLI prints `mesh: <device>:
+  stalled: <hint>`. Not while stdin is still streaming in, not with `-t`. One timer per link (a
+  thread per one-shot / durable command). Opt out: `--no-stall` (MCP `stall: false`).
+  Internal execs (`status`, `update`, `cp`, `up`) don't ask for it.
+- **Plain output**: non-`-t` commands get `NO_COLOR=1` and `TERM=dumb` (before `-e`; PowerShell
+  7.2+ then renders `PlainText`). `--json` / MCP results drop ANSI escape sequences and turn
+  CRLF into LF; the live CLI stream is raw.
+- Windows: the serving side gives a command's stdio named pipes opened for overlapped I/O (like
+  sshd's own), not std's synchronous anonymous pipes: with those, Win32-OpenSSH's `ssh.exe`
+  inside an SSH session prints nothing while its stdin is open and never exits with a stdout
+  pipe (`mesh exec blade ssh vps uname` hung until the timeout; now 0.6 s).
 - A target naming a device missing from the cache runs one sync first (§5.1).
 - The remote process gets `MESH_FROM=<calling device>`.
 - Nested (`mesh exec` run inside a `mesh exec` on a Windows device): no mux, one-shot SSH per
@@ -437,6 +452,8 @@ JSON result (also the MCP `exec` result):
 {
   "results": [
     { "device": "blade", "exit": 0, "ms": 1210, "stdout": "…", "stderr": "", "truncated": false },
+    { "device": "vps", "exit": 124, "ms": 20210, "stdout": "", "stderr": "", "truncated": false,
+      "error": "stalled", "hint": "no output and idle for 20 s; is it waiting for input?" },
     { "device": "air", "error": "offline" }
   ]
 }
@@ -581,8 +598,10 @@ The first stdin line is a JSON envelope; everything after it is passed to the ch
 
 ```jsonc
 { "v": 1, "from": "adais",
-  "argv": ["opencode", "api", "session.active"],   // or "command": "<string>" (-c mode)
-  "cwd": "D:\\Hona\\app", "env": { "K": "V" }, "tty": false, "timeout": 120 }
+  "argv": ["opencode", "api", "session.active"],   // or "command": "<string>" (-c), "script" (-s)
+  "cwd": "D:\\Hona\\app", "env": { "K": "V" }, "tty": false, "timeout": 120,
+  "stdin": false,     // nothing streams: the command's stdin is the null device (absent = true)
+  "stall": true }     // stall detection (absent = off)
 ```
 
 - The remote side is just `mesh exec self`: it resolves `opencode`/`mesh`, sets `MESH_FROM`,
@@ -764,11 +783,13 @@ ssh-ed25519 AAAA… opencode-mesh:air
 ### 8.2 `exec`
 
 ```jsonc
-// input — exactly one of argv | command
+// input — exactly one of argv | command | script
 { "target":    { "type": "string" },                                 // required
   "argv":      { "type": "array", "items": { "type": "string" } },   // no shell
   "command":   { "type": "string" },                                 // device's shell (-c)
-  "stdin":     { "type": "string" },
+  "script":    { "type": "string" },                                 // device's shell (-s); not with stdin
+  "stdin":     { "type": "string" },                                 // absent: stdin is the null device
+  "stall":     { "type": "boolean", "default": true },               // §5.5
   "cwd":       { "type": "string" },
   "env":       { "type": "object", "additionalProperties": { "type": "string" } },
   "timeout":   { "type": "number", "default": 120 },                 // seconds

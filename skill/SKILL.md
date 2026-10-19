@@ -16,12 +16,15 @@ Remote exec of the opencode CLI always works: every device runs opencode, and
     mesh status [target] [--fast]           list devices: os, shell, online, opencode version, busy
     mesh exec <target> <cmd> [args…]        run an exact argv, no shell
     mesh exec <target> -c '<string>'        run a string in that device's shell (see `shell` in status)
-        -w <dir>  -e KEY=VAL  -t  --timeout <s>  --json
+    mesh exec <target> -s < script          run a multi-line script (stdin) in that device's shell, no quoting
+        -w <dir>  -e KEY=VAL  -t  --timeout <s>  --no-stall  --json
     mesh cp [-r] <src> <dst>                copy files; paths are local or device:path (device→device works)
 
 Targets: `name` · `a,b` · `all` (includes this device) · `self` · `os:linux|macos|windows` · `--exclude <list>`
 
-MCP tools `mesh_status` and `mesh_exec` are the same commands with JSON output.
+MCP tools `mesh_status` and `mesh_exec` are the same commands with JSON output (`mesh_exec` `script` = `-s`, `stall: false` = `--no-stall`).
+
+Without stdin, a command's stdin is empty. A command with no output and an idle process for 20 s ends as `stalled` (exit 124); pass `--no-stall` / `stall: false` for commands that wait quietly.
 
 If `mesh` isn't on PATH, use the CLI path from the mesh MCP instructions.
 
@@ -32,7 +35,6 @@ On Windows and macOS devices, tools that keep their login in the OS credential s
 Don't send work back to the device that sent it to you (`MESH_FROM` is set on remote commands).
 
 Use `--durable` (MCP `durable: true`) when what the command starts must keep running after it returns.
-On Windows devices, run network clients that misbehave inside SSH (e.g. `ssh` to another host) with `--durable` / `durable: true`.
 
 ## Recovery
 

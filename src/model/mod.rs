@@ -69,11 +69,21 @@ pub(crate) struct Envelope {
     pub argv: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// Script mode: fed to the device's shell (SPEC §5.5 `-s`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
     pub tty: bool,
+    /// The client streams stdin; false: the command's stdin is the null device (absent = true,
+    /// as older clients always streamed).
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub stdin: bool,
+    /// End the command early when it stalls (SPEC §5.5).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub stall: bool,
     /// Run outside the SSH session so what it starts outlives it (SPEC §5.5).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub durable: bool,
@@ -83,6 +93,14 @@ pub(crate) struct Envelope {
     /// Mux only: which device the command is for.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device: Option<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 /// How a remote command ended (the `exit` frame).
@@ -109,6 +127,8 @@ pub(crate) struct ExecResult {
     pub truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
 }
 
 #[derive(Serialize)]

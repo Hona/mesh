@@ -4,15 +4,15 @@
 use super::{VERSION, store};
 use crate::host::process;
 use crate::host::{opencode, paths};
-use crate::model::{Envelope, ExitInfo};
+use crate::model::{Envelope, ExitInfo, Shell};
 use crate::transport::frame::{self, CANCEL, EXIT, HELLO, PING, START, STDERR, STDIN, STDOUT};
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Exit code reported when `timeout` killed the command (as coreutils `timeout`).
 pub(crate) const TIMED_OUT: i32 = 124;
@@ -55,19 +55,26 @@ fn resolve(prog: &str) -> Result<PathBuf, String> {
     }
 }
 
-/// `-c`: the string in the shell `mesh up` recorded for this device (SPEC §4.2). No detection
-/// or fallback here.
-fn shell(s: &str) -> Result<Command, String> {
-    let sh = store::read_state()
+/// The shell `mesh up` recorded for this device (SPEC §4.2). No detection or fallback here.
+fn recorded_shell() -> Result<Shell, String> {
+    store::read_state()
         .ok()
         .and_then(|st| st.shell)
         .filter(|sh| Path::new(&sh.path).is_file())
-        .ok_or("no shell recorded for `exec -c` on this device (or it was uninstalled): run `mesh up` here")?;
+        .ok_or_else(|| {
+            "no shell recorded for `exec -c` on this device (or it was uninstalled): run `mesh up` here".into()
+        })
+}
+
+const PWSH: [&str; 3] = ["-NoLogo", "-NoProfile", "-NonInteractive"];
+
+/// `-c`: the string in the device's shell.
+fn shell(s: &str) -> Result<Command, String> {
+    let sh = recorded_shell()?;
     let mut c = process::command(&sh.path);
     match sh.name.as_str() {
         "pwsh" | "powershell" => {
-            c.args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
-                .arg(s);
+            c.args(PWSH).arg("-Command").arg(s);
         }
         #[cfg(windows)]
         "cmd" => {
@@ -81,17 +88,105 @@ fn shell(s: &str) -> Result<Command, String> {
     Ok(c)
 }
 
-pub(crate) fn build(env: &Envelope) -> Result<Command, String> {
-    let mut c = match (&env.argv, &env.command) {
-        (Some(argv), _) => {
+/// A script file mesh wrote; deleted when dropped (after the command ends).
+pub(crate) struct ScriptFile(PathBuf);
+
+impl Drop for ScriptFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// `-s`: unix shells read the script from stdin (`sh -s`). PowerShell's `-Command -` reads
+/// stdin line by line like a prompt (an `else` on its own line silently ends the script), so
+/// PowerShell and cmd run a temp file instead.
+fn script(s: &str) -> Result<Built, String> {
+    let sh = recorded_shell()?;
+    let mut c = process::command(&sh.path);
+    let ext = match sh.name.as_str() {
+        "pwsh" | "powershell" => "ps1",
+        "cmd" => "cmd",
+        name => {
+            if name != "fish" {
+                c.arg("-s"); // fish reads a piped stdin as is, and has no -s
+            }
+            return Ok(Built {
+                cmd: c,
+                input: Some(s.as_bytes().to_vec()),
+                file: None,
+            });
+        }
+    };
+    static N: AtomicU32 = AtomicU32::new(0);
+    let dir = paths::state_dir().join("run");
+    let path = dir.join(format!(
+        "script-{}-{}.{ext}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    let body = if ext == "cmd" {
+        // cmd echoes every line unless told not to, and wants CRLF
+        format!("@echo off\n{s}")
+            .replace("\r\n", "\n")
+            .replace('\n', "\r\n")
+    } else {
+        format!("\u{feff}{s}") // BOM: Windows PowerShell reads BOM-less files as ANSI
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    std::fs::write(&path, body).map_err(|e| format!("{}: {e}", path.display()))?;
+    let file = ScriptFile(path);
+    if ext == "cmd" {
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.raw_arg(format!("/d /c \"{}\"", file.0.display()));
+        }
+    } else {
+        c.args(PWSH)
+            .args(["-ExecutionPolicy", "Bypass", "-File"])
+            .arg(&file.0);
+    }
+    Ok(Built {
+        cmd: c,
+        input: None,
+        file: Some(file),
+    })
+}
+
+/// What to run for an envelope.
+pub(crate) struct Built {
+    pub cmd: Command,
+    /// The child's stdin instead of the client's (the script for `sh -s`).
+    pub input: Option<Vec<u8>>,
+    /// Keep until the command ends.
+    pub file: Option<ScriptFile>,
+}
+
+pub(crate) fn build(env: &Envelope) -> Result<Built, String> {
+    let mut b = match (&env.argv, &env.command, &env.script) {
+        (Some(argv), _, _) => {
             let (prog, args) = argv.split_first().ok_or("empty argv")?;
             let mut c = process::command(resolve(prog)?);
             c.args(args);
-            c
+            Built {
+                cmd: c,
+                input: None,
+                file: None,
+            }
         }
-        (None, Some(s)) => shell(s)?,
-        (None, None) => return Err("envelope has neither argv nor command".into()),
+        (None, Some(s), _) => Built {
+            cmd: shell(s)?,
+            input: None,
+            file: None,
+        },
+        (None, None, Some(s)) => script(s)?,
+        (None, None, None) => return Err("envelope has no argv, command or script".into()),
     };
+    let c = &mut b.cmd;
+    if !env.tty {
+        // plain text for programs (and PowerShell 7.2+, whose errors are coloured otherwise)
+        c.env("NO_COLOR", "1").env("TERM", "dumb");
+    }
     if let Some(dir) = &env.cwd {
         let dir = match dir.strip_prefix('~') {
             Some(rest) => paths::home().join(rest.trim_start_matches(['/', '\\'])),
@@ -101,13 +196,73 @@ pub(crate) fn build(env: &Envelope) -> Result<Command, String> {
     }
     c.envs(&env.env).env("MESH_FROM", &env.from);
     #[cfg(target_os = "linux")]
-    let c = if super::durable::wanted(env) {
-        super::durable::scope(c)
-    } else {
-        c
-    };
-    Ok(c)
+    if super::durable::wanted(env) {
+        let c = std::mem::replace(&mut b.cmd, Command::new(""));
+        b.cmd = super::durable::scope(c);
+    }
+    Ok(b)
 }
+
+/// No output and an idle process tree this long ends a command (SPEC §5.5).
+pub(crate) const STALL: Duration = Duration::from_secs(20);
+const TICK: Duration = Duration::from_secs(5);
+pub(crate) const STALLED: &str = "stalled";
+
+/// Stall detection for one command, sampled every `TICK`: a tick with no new output and the
+/// tree under 1% CPU with no I/O is idle; `STALL` of idle ticks is a stall.
+pub(crate) struct Watch {
+    /// Output bytes so far (pumps add to it).
+    out: Arc<AtomicU64>,
+    seen: u64,
+    usage: Option<(u64, u64)>,
+    idle_since: Instant,
+    next: Instant,
+}
+
+impl Watch {
+    pub(crate) fn new(out: Arc<AtomicU64>) -> Watch {
+        let now = Instant::now();
+        Watch {
+            out,
+            seen: 0,
+            usage: None,
+            idle_since: now,
+            next: now + TICK,
+        }
+    }
+
+    /// Call often; samples once per `TICK`. True once the command has stalled.
+    pub(crate) fn stalled(&mut self, k: &process::Killer) -> bool {
+        let now = Instant::now();
+        if now < self.next {
+            return false;
+        }
+        self.next = now + TICK;
+        let out = self.out.load(Ordering::Relaxed);
+        if out != self.seen {
+            self.seen = out;
+            self.usage = None;
+            self.idle_since = now;
+            return false;
+        }
+        let Some(u) = k.usage() else {
+            self.idle_since = now; // unknown here: never a stall
+            return false;
+        };
+        if let Some((cpu, io)) = self.usage.replace(u)
+            && (u.0.abs_diff(cpu) > TICK.as_millis() as u64 / 100 || u.1 != io)
+        {
+            self.idle_since = now;
+        }
+        now - self.idle_since >= STALL
+    }
+}
+
+/// How a command ended: still running, killed at the timeout or as stalled, or by itself.
+const RAN: u8 = 0;
+const TIMEOUT: u8 = 1;
+const STALL_KILL: u8 = 2;
+const DONE: u8 = 3;
 
 fn what(env: &Envelope) -> String {
     env.argv
@@ -170,43 +325,94 @@ pub(crate) fn envelope(arg: Option<&str>) -> i32 {
             let _ = o.write_all(b);
             let _ = o.flush();
         });
-        if let Some(err) = &info.error {
-            eprintln!("mesh: {err}");
+        match info.error.as_deref() {
+            Some(STALLED) => eprintln!("mesh: {STALLED}: {STALL_HINT}"),
+            Some(err) => eprintln!("mesh: {err}"),
+            None => {}
         }
         return info.code.unwrap_or(255);
     }
-    let (mut child, killer) = match env.as_ref().map_err(String::clone).and_then(|e| {
-        let mut c = build(e)?;
-        process::spawn_tree(&mut c).map_err(|err| format!("{}: {err}", what(e)))
-    }) {
+    let spawned = env.and_then(|e| {
+        let mut b = build(&e)?;
+        // the child's stdin: the script, the SSH channel past the envelope line, or nothing
+        let feed = b.input.take();
+        if feed.is_some() {
+            b.cmd.stdin(Stdio::piped());
+        } else if !e.stdin {
+            b.cmd.stdin(Stdio::null());
+        }
+        let (mut child, killer) =
+            process::spawn_tree(&mut b.cmd).map_err(|err| format!("{}: {err}", what(&e)))?;
+        if let (Some(s), Some(mut w)) = (feed, child.stdin.take()) {
+            std::thread::spawn(move || w.write_all(&s));
+        }
+        Ok((e, b, child, killer))
+    });
+    let (env, _b, mut child, killer) = match spawned {
         Ok(x) => x,
         Err(e) => {
             eprintln!("mesh: {e}");
             return 127;
         }
     };
-    let timed_out = Arc::new(AtomicBool::new(false));
-    if let Some(t) = env.ok().and_then(|e| e.timeout) {
-        let k = Arc::new(killer);
-        let (k2, flag) = (k.clone(), timed_out.clone());
-        std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_secs_f64(t));
-            flag.store(true, Ordering::Relaxed);
-            k2.kill();
-        });
-        let c = code(child.wait());
-        return if timed_out.load(Ordering::Relaxed) {
-            TIMED_OUT
-        } else {
-            k.release();
-            c
-        };
+    let killer = Arc::new(killer);
+    let ended = Arc::new(AtomicU8::new(RAN));
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    if let Some(t) = env.timeout {
+        timer(t, killer.clone(), ended.clone(), done_rx);
     }
-    // A normal exit leaves what the command started running; only timeout, cancel and a lost
-    // client kill the tree (this process dying closes the still kill-on-close job).
+    if env.stall {
+        // Output goes straight to SSH's channel, so only the tree's I/O shows it here.
+        let (k, ended) = (killer.clone(), ended.clone());
+        std::thread::spawn(move || {
+            let mut w = Watch::new(Arc::default());
+            while ended.load(Ordering::Relaxed) == RAN {
+                std::thread::sleep(TICK);
+                if w.stalled(&k) {
+                    stall_kill(&k, &ended);
+                }
+            }
+        });
+    }
     let c = code(child.wait());
-    killer.release();
-    c
+    drop(done_tx);
+    match ended.swap(DONE, Ordering::Relaxed) {
+        TIMEOUT => TIMED_OUT,
+        STALL_KILL => {
+            eprintln!("mesh: {STALLED}: {STALL_HINT}");
+            TIMED_OUT
+        }
+        // A normal exit leaves what the command started running; only timeout, stall, cancel
+        // and a lost client kill the tree (this process dying closes the kill-on-close job).
+        _ => {
+            killer.release();
+            c
+        }
+    }
+}
+
+pub(crate) const STALL_HINT: &str = "no output and idle for 20 s; is it waiting for input?";
+
+fn stall_kill(k: &process::Killer, ended: &AtomicU8) {
+    if ended
+        .compare_exchange(RAN, STALL_KILL, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
+    {
+        k.kill();
+    }
+}
+
+/// Kill the tree `t` seconds from now unless `done` drops first.
+fn timer(t: f64, k: Arc<process::Killer>, ended: Arc<AtomicU8>, done: mpsc::Receiver<()>) {
+    std::thread::spawn(move || {
+        if done.recv_timeout(Duration::from_secs_f64(t)) == Err(mpsc::RecvTimeoutError::Timeout)
+            && ended
+                .compare_exchange(RAN, TIMEOUT, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            k.kill();
+        }
+    });
 }
 
 type Out = Arc<Mutex<io::Stdout>>;
@@ -227,9 +433,28 @@ struct Running {
     stdin: Option<mpsc::Sender<Vec<u8>>>,
     /// Cancel / lost link: kill the tree (or ask the run task to, for a durable command).
     stop: Arc<dyn Fn() + Send + Sync>,
+    /// Stall detection, when asked for.
+    watch: Option<(Watch, Arc<process::Killer>, Arc<AtomicU8>)>,
 }
 
 type Table = Arc<Mutex<HashMap<u32, Running>>>;
+
+/// One timer for every command on the link: stall checks while no stdin is still streaming in
+/// (a command waiting for its caller's input isn't stalled).
+fn watch_stalls(table: Table) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(TICK);
+            for r in lock(&table).values_mut() {
+                if let (None, Some((w, k, ended))) = (&r.stdin, &mut r.watch)
+                    && w.stalled(k)
+                {
+                    stall_kill(k, ended);
+                }
+            }
+        }
+    });
+}
 
 /// Persistent link: many concurrent commands, framed on stdin/stdout.
 pub(crate) fn serve() -> i32 {
@@ -242,6 +467,7 @@ pub(crate) fn serve() -> i32 {
         format!(r#"{{"v":1,"mesh":"{VERSION}"}}"#).as_bytes(),
     );
     let table: Table = Arc::new(Mutex::new(HashMap::new()));
+    watch_stalls(table.clone());
     let mut input = io::BufReader::with_capacity(frame::CHUNK, io::stdin().lock());
     while let Ok(Some(f)) = frame::read(&mut input) {
         match f.kind {
@@ -285,6 +511,7 @@ fn start_durable(id: u32, env: Envelope, out: &Out, table: &Table) {
         Running {
             stdin: None,
             stop: Arc::new(move || super::durable::cancel(&j)),
+            watch: None, // the run task watches it
         },
     );
     let (out, table) = (out.clone(), table.clone());
@@ -307,91 +534,86 @@ fn start(id: u32, data: &[u8], out: &Out, table: &Table) -> Result<(), (i32, Str
         start_durable(id, env, out, table);
         return Ok(());
     }
-    let mut cmd = build(&env).map_err(|e| (127, e))?;
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let (mut child, killer) =
-        process::spawn_tree(&mut cmd).map_err(|e| (127, format!("{}: {e}", what(&env))))?;
+    let Built {
+        mut cmd,
+        input: feed,
+        file,
+    } = build(&env).map_err(|e| (127, e))?;
+    let spawned = process::pipes(&mut cmd, feed.is_some() || env.stdin).and_then(|p| {
+        let (child, killer) = process::spawn_tree(&mut cmd)?;
+        Ok((p, child, killer))
+    });
+    drop(cmd); // our copies of the child's pipe ends
+    let ((stdin, stdout, stderr), mut child, killer) =
+        spawned.map_err(|e| (127, format!("{}: {e}", what(&env))))?;
     let killer = Arc::new(killer);
     let (tx, rx) = mpsc::channel::<Vec<u8>>();
-    if let Some(mut w) = child.stdin.take() {
-        std::thread::spawn(move || {
-            for chunk in rx {
-                if w.write_all(&chunk).is_err() {
-                    break;
+    let tx = match (stdin, feed) {
+        (Some(mut w), Some(s)) => {
+            std::thread::spawn(move || w.write_all(&s));
+            None
+        }
+        (Some(mut w), None) => {
+            std::thread::spawn(move || {
+                for chunk in rx {
+                    if w.write_all(&chunk).is_err() {
+                        break;
+                    }
                 }
-            }
-        });
-    }
+            });
+            Some(tx)
+        }
+        _ => None,
+    };
+    let written = Arc::new(AtomicU64::new(0));
     let mut pumps = Vec::new();
-    let streams: [(Option<Box<dyn Read + Send>>, u8); 2] = [
-        (
-            child
-                .stdout
-                .take()
-                .map(|s| Box::new(s) as Box<dyn Read + Send>),
-            STDOUT,
-        ),
-        (
-            child
-                .stderr
-                .take()
-                .map(|s| Box::new(s) as Box<dyn Read + Send>),
-            STDERR,
-        ),
-    ];
-    for (stream, kind) in streams {
-        let (Some(mut r), out) = (stream, out.clone()) else {
-            continue;
-        };
+    for (mut r, kind) in [(stdout, STDOUT), (stderr, STDERR)] {
+        let (out, written) = (out.clone(), written.clone());
         pumps.push(std::thread::spawn(move || {
             let mut buf = vec![0u8; frame::CHUNK];
             while let Ok(n @ 1..) = r.read(&mut buf) {
+                written.fetch_add(n as u64, Ordering::Relaxed);
                 send(&out, kind, id, &buf[..n]);
             }
         }));
     }
+    let ended = Arc::new(AtomicU8::new(RAN));
     let k = killer.clone();
     lock(table).insert(
         id,
         Running {
-            stdin: Some(tx),
+            stdin: tx,
             stop: Arc::new(move || k.kill()),
+            watch: env
+                .stall
+                .then(|| (Watch::new(written), killer.clone(), ended.clone())),
         },
     );
-    let timed_out = Arc::new(AtomicBool::new(false));
     let (done_tx, done_rx) = mpsc::channel::<()>();
     if let Some(t) = env.timeout {
-        let (k, flag) = (killer.clone(), timed_out.clone());
-        std::thread::spawn(move || {
-            if done_rx.recv_timeout(Duration::from_secs_f64(t))
-                == Err(mpsc::RecvTimeoutError::Timeout)
-            {
-                flag.store(true, Ordering::Relaxed);
-                k.kill();
-            }
-        });
+        timer(t, killer.clone(), ended.clone(), done_rx);
     }
     let (out, table, timeout) = (out.clone(), table.clone(), env.timeout);
     std::thread::spawn(move || {
         let st = child.wait();
         drop(done_tx);
-        if !timed_out.load(Ordering::Relaxed) {
+        let how = ended.swap(DONE, Ordering::Relaxed);
+        if how == RAN {
             killer.release();
         }
         for p in pumps {
             let _ = p.join();
         }
-        let exit = if timed_out.load(Ordering::Relaxed) {
-            exit_frame(
+        drop(file);
+        lock(&table).remove(&id);
+        let exit = match how {
+            TIMEOUT => exit_frame(
                 TIMED_OUT,
                 Some(format!("timeout after {}s", timeout.unwrap_or_default())),
-            )
-        } else {
-            exit_frame(code(st), None)
+            ),
+            STALL_KILL => exit_frame(TIMED_OUT, Some(STALLED.into())),
+            _ => exit_frame(code(st), None),
         };
-        lock(&table).remove(&id);
         send(&out, EXIT, id, &exit);
     });
     Ok(())

@@ -27,8 +27,9 @@ Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version
   leave    remove this device from the mesh      mesh leave [--yes]
   update   update mesh on every device           mesh update [--version <x.y.z>] [--check]
   status   list devices                          mesh status [<target>] [--fast]
-  exec     run a command on devices              mesh exec [-t] [-w <dir>] [-e K=V]... [--timeout <s>] [--durable] <target> <cmd> [args…]
+  exec     run a command on devices              mesh exec [-t] [-w <dir>] [-e K=V]... [--timeout <s>] [--durable] [--no-stall] <target> <cmd> [args…]
                                                  mesh exec [flags] <target> -c '<string>'
+                                                 mesh exec [flags] <target> -s          (script on stdin, run by the device's shell)
   cp       copy files between devices            mesh cp [-r] <src> <dst>      (each side: path or <device>:<path>)
   mcp      stdio MCP server (started by opencode)
 
@@ -243,7 +244,10 @@ fn exec(args: &[String], out: &mut Out) -> Result<i32, Fail> {
             _ => {}
         }
     }
-    let mut env = Envelope::default();
+    let mut env = Envelope {
+        stall: true,
+        ..Default::default()
+    };
     let (mut tty, mut exclude) = (false, None);
     let mut i = 0;
     while let Some(a) = args.get(i) {
@@ -256,6 +260,7 @@ fn exec(args: &[String], out: &mut Out) -> Result<i32, Fail> {
         match a.as_str() {
             "-t" => tty = true,
             "--durable" => env.durable = true,
+            "--no-stall" => env.stall = false,
             "-w" => env.cwd = Some(value()?),
             "-e" => {
                 let kv = value()?;
@@ -296,9 +301,31 @@ fn exec(args: &[String], out: &mut Out) -> Result<i32, Fail> {
     if cmd.first().map(String::as_str) == Some("--") {
         cmd.remove(0);
     }
+    let mut input = Input::Inherit;
     match cmd.first().map(String::as_str) {
         Some("-c") if cmd.len() == 2 => env.command = cmd.pop(),
         Some("-c") => return Err(usage("exec", "-c takes exactly one string")),
+        Some("-s") if cmd.len() == 1 => {
+            use std::io::Read;
+            let mut s = String::new();
+            std::io::stdin()
+                .read_to_string(&mut s)
+                .map_err(|e| usage("exec", format!("-s reads the script from stdin: {e}")))?;
+            if s.trim().is_empty() {
+                return Err(usage(
+                    "exec",
+                    "-s reads the script from stdin, and it was empty",
+                ));
+            }
+            env.script = Some(s);
+            input = Input::Empty;
+        }
+        Some("-s") => {
+            return Err(usage(
+                "exec",
+                "-s takes no arguments (the script comes on stdin)",
+            ));
+        }
         None => return Err(usage("exec", "missing <cmd>")),
         _ => env.argv = Some(cmd),
     }
@@ -310,13 +337,16 @@ fn exec(args: &[String], out: &mut Out) -> Result<i32, Fail> {
         if env.durable {
             return Err(usage("exec", "--durable can't take a terminal (-t)"));
         }
+        if env.script.is_some() {
+            return Err(usage("exec", "-s can't take a terminal (-t)"));
+        }
         let [d] = devices.as_slice() else {
             return Err(usage("exec", "-t needs exactly one device"));
         };
         return exec::interactive(&me, d, &env);
     }
     if out.json {
-        let results = exec::capture(&me, &devices, &env, Input::Inherit, usize::MAX);
+        let results = exec::capture(&me, &devices, &env, input, usize::MAX);
         let code = match results.as_slice() {
             [r] => r.exit.unwrap_or(255),
             rs if rs.iter().all(|r| r.exit == Some(0)) => 0,
@@ -325,7 +355,7 @@ fn exec(args: &[String], out: &mut Out) -> Result<i32, Fail> {
         render::json(&ExecReport { results });
         return Ok(code);
     }
-    Ok(render::exec_live(&me, &devices, &env))
+    Ok(render::exec_live(&me, &devices, &env, input))
 }
 
 fn cp(args: &[String]) -> Result<i32, Fail> {

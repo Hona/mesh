@@ -217,13 +217,15 @@ mod win {
         };
         let spawned = (|| {
             let log = fs::File::create(f("log")).map_err(|e| e.to_string())?;
-            let mut cmd = serve::build(&job.env)?;
-            cmd.stdin(Stdio::null())
+            let mut b = serve::build(&job.env)?;
+            b.cmd
+                .stdin(Stdio::null())
                 .stdout(log.try_clone().map_err(|e| e.to_string())?)
                 .stderr(log);
-            process::spawn_tree(&mut cmd).map_err(|e| e.to_string())
+            let (child, killer) = process::spawn_tree(&mut b.cmd).map_err(|e| e.to_string())?;
+            Ok::<_, String>((child, killer, b.file))
         })();
-        let (mut child, killer) = match spawned {
+        let (mut child, killer, _script) = match spawned {
             Ok(x) => x,
             Err(e) => {
                 let _ = fs::remove_file(claimed);
@@ -234,6 +236,8 @@ mod win {
         let t0 = Instant::now();
         let timeout = job.env.timeout.map(Duration::from_secs_f64);
         let mut checked = Instant::now();
+        // output lands in the log file, which the tree's I/O counts show
+        let mut watch = job.env.stall.then(|| serve::Watch::new(Default::default()));
         let exit = loop {
             if let Ok(Some(st)) = child.try_wait() {
                 killer.release(); // what it started keeps running
@@ -249,6 +253,8 @@ mod win {
                     TIMED_OUT,
                     format!("timeout after {}s", job.env.timeout.unwrap_or_default()),
                 ))
+            } else if watch.as_mut().is_some_and(|w| w.stalled(&killer)) {
+                Some((TIMED_OUT, serve::STALLED.to_string()))
             } else if checked.elapsed() >= Duration::from_secs(1) {
                 checked = Instant::now();
                 process::parent(job.caller)

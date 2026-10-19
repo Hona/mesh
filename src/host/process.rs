@@ -36,6 +36,150 @@ pub(crate) fn command(program: impl AsRef<OsStr>) -> Command {
     c
 }
 
+/// This process's stdin is a pipe or file to stream (not a terminal, the null device or closed).
+pub(crate) fn stdin_streams() -> bool {
+    use std::io::IsTerminal;
+    if io::stdin().is_terminal() {
+        return false;
+    }
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetStdHandle(id: u32) -> *mut std::ffi::c_void;
+            fn GetFileType(h: *mut std::ffi::c_void) -> u32;
+        }
+        let h = GetStdHandle(-10i32 as u32);
+        // FILE_TYPE_DISK | FILE_TYPE_PIPE; a char device that isn't a console is NUL
+        !h.is_null() && h as isize != -1 && matches!(GetFileType(h), 1 | 3)
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        use std::os::unix::io::FromRawFd;
+        let f = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(0) });
+        let Ok(m) = f.metadata() else { return false }; // closed
+        let null = std::fs::metadata("/dev/null").map(|n| n.rdev()).ok();
+        !(m.file_type().is_char_device() && Some(m.rdev()) == null)
+    }
+}
+
+pub(crate) type Reader = Box<dyn io::Read + Send>;
+pub(crate) type Writer = Box<dyn io::Write + Send>;
+
+/// Pipe `cmd`'s stdio to us: stdin when `input` (else the null device), stdout, stderr. Drop
+/// `cmd` once spawned, so the readers see EOF when the child is done.
+///
+/// Windows: the child's ends are named pipes opened for overlapped I/O, like sshd's own. With
+/// the synchronous anonymous pipes std creates, Win32-OpenSSH's ssh.exe inside an SSH session
+/// prints nothing while its stdin is open and never exits with a stdout pipe.
+pub(crate) fn pipes(
+    cmd: &mut Command,
+    input: bool,
+) -> io::Result<(Option<Writer>, Reader, Reader)> {
+    let stdin = if input {
+        let (ours, theirs) = pipe_in()?;
+        cmd.stdin(theirs);
+        Some(ours)
+    } else {
+        cmd.stdin(Stdio::null());
+        None
+    };
+    let (out, theirs) = pipe_out()?;
+    cmd.stdout(theirs);
+    let (err, theirs) = pipe_out()?;
+    cmd.stderr(theirs);
+    Ok((stdin, out, err))
+}
+
+#[cfg(unix)]
+fn pipe_in() -> io::Result<(Writer, Stdio)> {
+    let (r, w) = io::pipe()?;
+    Ok((Box::new(w), r.into()))
+}
+
+#[cfg(unix)]
+fn pipe_out() -> io::Result<(Reader, Stdio)> {
+    let (r, w) = io::pipe()?;
+    Ok((Box::new(r), w.into()))
+}
+
+#[cfg(windows)]
+fn pipe_in() -> io::Result<(Writer, Stdio)> {
+    win_pipe(true).map(|(f, s)| (Box::new(f) as Writer, s))
+}
+
+#[cfg(windows)]
+fn pipe_out() -> io::Result<(Reader, Stdio)> {
+    win_pipe(false).map(|(f, s)| (Box::new(f) as Reader, s))
+}
+
+/// (our synchronous end, the child's overlapped end)
+#[cfg(windows)]
+fn win_pipe(child_reads: bool) -> io::Result<(std::fs::File, Stdio)> {
+    use std::ffi::c_void;
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use std::ptr::null_mut;
+    use std::sync::atomic::AtomicU64;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateNamedPipeW(
+            name: *const u16,
+            open: u32,
+            mode: u32,
+            max: u32,
+            out_size: u32,
+            in_size: u32,
+            timeout: u32,
+            sa: *mut c_void,
+        ) -> *mut c_void;
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            sa: *mut c_void,
+            disposition: u32,
+            flags: u32,
+            template: *mut c_void,
+        ) -> *mut c_void;
+    }
+    static N: AtomicU64 = AtomicU64::new(0);
+    let name = super::win::wide(format!(
+        r"\\.\pipe\opencode-mesh-io-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    // ours: outbound or inbound | FILE_FLAG_FIRST_PIPE_INSTANCE; byte mode, no remote clients
+    let open = if child_reads { 0x2 } else { 0x1 } | 0x0008_0000;
+    // theirs: GENERIC_READ | FILE_WRITE_ATTRIBUTES, or GENERIC_WRITE | FILE_READ_ATTRIBUTES
+    let access = if child_reads {
+        0x8000_0000 | 0x100
+    } else {
+        0x4000_0000 | 0x80
+    };
+    unsafe {
+        let ours = CreateNamedPipeW(name.as_ptr(), open, 0x8, 1, 65536, 65536, 0, null_mut());
+        if ours as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let ours = std::fs::File::from_raw_handle(ours);
+        // OPEN_EXISTING, FILE_FLAG_OVERLAPPED
+        let theirs = CreateFileW(
+            name.as_ptr(),
+            access,
+            0,
+            null_mut(),
+            3,
+            0x4000_0000,
+            null_mut(),
+        );
+        if theirs as isize == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok((ours, OwnedHandle::from_raw_handle(theirs).into()))
+    }
+}
+
 /// Run `cmd` (stdin null) for at most `limit`: (success, stdout, stderr), or None if it couldn't
 /// start or was killed at the limit. Never waits on a grandchild still holding the pipes.
 pub(crate) fn output_within(
@@ -127,6 +271,13 @@ mod job {
         -> i32;
         pub fn AssignProcessToJobObject(job: Handle, process: Handle) -> i32;
         pub fn TerminateJobObject(job: Handle, code: u32) -> i32;
+        pub fn QueryInformationJobObject(
+            job: Handle,
+            class: u32,
+            info: *mut c_void,
+            len: u32,
+            ret: *mut u32,
+        ) -> i32;
     }
     #[link(name = "ntdll")]
     unsafe extern "system" {
@@ -194,6 +345,65 @@ impl Killer {
                 size_of::<ExtendedLimit>() as u32,
             );
         }
+    }
+
+    /// The tree's CPU time (ms) and I/O count so far, for stall detection; None where unknown
+    /// (macOS). Exited processes may drop out of the sums: any change means activity.
+    pub(crate) fn usage(&self) -> Option<(u64, u64)> {
+        #[cfg(windows)]
+        unsafe {
+            // JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION: user + kernel time (100 ns) first,
+            // IO_COUNTERS (op counts, then bytes) in the last six u64s
+            let mut b = [0u64; 12];
+            if job::QueryInformationJobObject(
+                self.job,
+                8,
+                b.as_mut_ptr().cast(),
+                96,
+                std::ptr::null_mut(),
+            ) == 0
+            {
+                return None;
+            }
+            Some(((b[0] + b[1]) / 10_000, b[6..].iter().sum()))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let (mut ticks, mut io) = (0u64, 0u64);
+            for e in std::fs::read_dir("/proc").ok()?.flatten() {
+                let name = e.file_name();
+                let Some(pid) = name
+                    .to_str()
+                    .filter(|s| s.bytes().all(|c| c.is_ascii_digit()))
+                else {
+                    continue;
+                };
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                    continue;
+                };
+                // after "pid (comm)": state ppid pgrp … utime stime (fields 2, 11, 12)
+                let f: Vec<&str> = match stat.rsplit_once(')') {
+                    Some((_, rest)) => rest.split_whitespace().collect(),
+                    None => continue,
+                };
+                let num = |i: usize| f.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+                if num(2) != self.pgid as u64 {
+                    continue;
+                }
+                ticks += num(11) + num(12);
+                for l in std::fs::read_to_string(format!("/proc/{pid}/io"))
+                    .unwrap_or_default()
+                    .lines()
+                {
+                    if let Some(v) = l.strip_prefix("rchar: ").or(l.strip_prefix("wchar: ")) {
+                        io += v.parse::<u64>().unwrap_or(0);
+                    }
+                }
+            }
+            Some((ticks * 10, io)) // USER_HZ is 100
+        }
+        #[cfg(target_os = "macos")]
+        None
     }
 
     pub(crate) fn kill(&self) {
