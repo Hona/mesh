@@ -167,11 +167,89 @@ pub(crate) struct Built {
     pub file: Option<ScriptFile>,
 }
 
+/// Files a login shell reads (stat only): a change re-captures the login environment.
+#[cfg(unix)]
+const PROFILES: [&str; 12] = [
+    "~/.zshenv",
+    "~/.zprofile",
+    "~/.zshrc",
+    "~/.zlogin",
+    "~/.bash_profile",
+    "~/.bash_login",
+    "~/.bashrc",
+    "~/.profile",
+    "~/.config/fish/config.fish",
+    "/etc/zprofile",
+    "/etc/profile",
+    "/etc/paths",
+];
+
+type EnvMap = std::collections::BTreeMap<String, String>;
+
+/// The user's login-shell environment (SPEC §5.5), captured once per process and again only
+/// when a profile file changes. None where it can't be had (it then isn't retried until one
+/// does).
+#[cfg(unix)]
+fn login_env() -> Option<EnvMap> {
+    type Sig = Vec<Option<std::time::SystemTime>>;
+    static CACHE: Mutex<Option<(Sig, Option<EnvMap>)>> = Mutex::new(None);
+    let home = paths::home();
+    let sig: Sig = PROFILES
+        .iter()
+        .map(|p| match p.strip_prefix("~/") {
+            Some(rel) => home.join(rel),
+            None => PathBuf::from(p),
+        })
+        .map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .collect();
+    let mut c = lock(&CACHE);
+    if let Some((s, e)) = &*c
+        && *s == sig
+    {
+        return e.clone();
+    }
+    let shell = recorded_shell()
+        .map(|s| PathBuf::from(s.path))
+        .ok()
+        .or_else(|| std::env::var_os("SHELL").map(PathBuf::from))?;
+    let t0 = Instant::now();
+    let e = process::login_env(&shell);
+    if IN_DAEMON.load(Ordering::Relaxed) {
+        eprintln!(
+            "login environment from {}: {} ({} ms)",
+            shell.display(),
+            if e.is_some() { "ok" } else { "failed" },
+            t0.elapsed().as_millis()
+        );
+    }
+    *c = Some((sig, e.clone()));
+    e
+}
+
+/// What a command's environment starts from. Unix: the user's login shell's (the PATH of a new
+/// terminal). Windows: the relaying SSH session's (built fresh from the registry), when relayed.
+fn base_env(env: &Envelope) -> Option<EnvMap> {
+    #[cfg(unix)]
+    if let Some(mut e) = login_env() {
+        if env.tty {
+            // the terminal's own type and colours, for an interactive command
+            for k in ["TERM", "COLORTERM"] {
+                if let Ok(v) = std::env::var(k) {
+                    e.insert(k.into(), v);
+                }
+            }
+        }
+        return Some(e);
+    }
+    env.relay_env.clone()
+}
+
 pub(crate) fn build(env: &Envelope) -> Result<Built, String> {
+    let base = base_env(env);
     let mut b = match (&env.argv, &env.command, &env.script) {
         (Some(argv), _, _) => {
             let (prog, args) = argv.split_first().ok_or("empty argv")?;
-            let path = env.relay_env.as_ref().and_then(|e| {
+            let path = base.as_ref().and_then(|e| {
                 e.iter()
                     .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
                     .map(|(_, v)| v)
@@ -193,7 +271,7 @@ pub(crate) fn build(env: &Envelope) -> Result<Built, String> {
         (None, None, None) => return Err("envelope has no argv, command or script".into()),
     };
     let c = &mut b.cmd;
-    if let Some(base) = &env.relay_env {
+    if let Some(base) = &base {
         c.env_clear().envs(base);
     }
     if !env.tty {
@@ -495,6 +573,8 @@ type Table = Arc<Mutex<HashMap<u32, Running>>>;
 static RUNNING: AtomicU32 = AtomicU32::new(0);
 /// Daemon: asked to quit; exit once nothing runs.
 pub(crate) static DRAINING: AtomicBool = AtomicBool::new(false);
+/// This process is the daemon (its stderr is its log).
+pub(crate) static IN_DAEMON: AtomicBool = AtomicBool::new(false);
 
 pub(crate) fn exit_if_drained() {
     if DRAINING.load(Ordering::Relaxed) && RUNNING.load(Ordering::Relaxed) == 0 {

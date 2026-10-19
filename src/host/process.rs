@@ -180,6 +180,29 @@ fn win_pipe(child_reads: bool) -> io::Result<(std::fs::File, Stdio)> {
     }
 }
 
+/// The environment of a new login shell of `shell`, interactive so zsh and bash also read their
+/// rc files, as a new terminal does (stdin null, at most 5 s). Shell-state variables dropped.
+#[cfg(unix)]
+pub(crate) fn login_env(
+    shell: &std::path::Path,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    // rc files may print: only what follows the marker counts
+    const MARK: &str = "__MESH_LOGIN_ENV__";
+    let (_, out, _) = output_within(
+        command(shell).args(["-l", "-i", "-c", &format!("printf {MARK}; env -0")]),
+        std::time::Duration::from_secs(5),
+    )?;
+    let out = String::from_utf8_lossy(&out);
+    let body = &out[out.find(MARK)? + MARK.len()..];
+    let env: std::collections::BTreeMap<String, String> = body
+        .split('\0')
+        .filter_map(|kv| kv.split_once('='))
+        .filter(|(k, _)| !matches!(*k, "PWD" | "OLDPWD" | "SHLVL" | "_" | ""))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    env.contains_key("PATH").then_some(env)
+}
+
 /// Run `cmd` (stdin null) for at most `limit`: (success, stdout, stderr), or None if it couldn't
 /// start or was killed at the limit. Never waits on a grandchild still holding the pipes.
 pub(crate) fn output_within(

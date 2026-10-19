@@ -182,6 +182,7 @@ pub(crate) fn run(mcp: McpServer) -> R<i32> {
     }
     #[cfg(unix)]
     process::set_background();
+    serve::IN_DAEMON.store(true, std::sync::atomic::Ordering::Relaxed);
     let Ok(listener) = ipc::bind(&tag()) else {
         eprintln!("daemon {VERSION} build {} already running", exec::BUILD);
         return Ok(0);

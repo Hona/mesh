@@ -413,8 +413,14 @@ mesh exec [flags] <target> -s            # script on stdin
   mid-command. A command that exits by itself leaves what it started running (Windows: the job
   stops being kill-on-close; it allows breakaway).
 - Commands run in the device's daemon (§6.6), in the user's own login session: what they start
-  outlives the SSH session, and the OS credential store (`gh`'s login) works. Their environment
-  is the SSH session's (fresh PATH and all), minus `SSH_*` / `XDG_SESSION_*`. Daemon
+  outlives the SSH session, and the OS credential store (`gh`'s login) works. Their base
+  environment: Linux/macOS, the user's login shell's, as in a new terminal (`<shell> -l -i -c
+  'env -0'`, stdin null, ≤ 5 s, minus `PWD`/`OLDPWD`/`SHLVL`/`_`; captured once per process and
+  again only when a profile file's mtime changes: `~/.zshenv`, `.zprofile`, `.zshrc`, `.zlogin`,
+  `.bash_profile`, `.bash_login`, `.bashrc`, `.profile`, fish `config.fish`, `/etc/zprofile`,
+  `/etc/profile`, `/etc/paths`: stat only, no spawn per command); Windows, the SSH session's
+  (built fresh from the registry), minus `SSH_*` / `XDG_SESSION_*`. On top: `NO_COLOR`/`TERM`,
+  `-e`, `MESH_FROM`, `MESH_SESSION` (with `-t`, the terminal's `TERM`/`COLORTERM`). Daemon
   unreachable (nobody logged on, crashed and not restartable): they run in the SSH session as a
   fallback. Each result says where: `"via": "daemon" | "ssh"` (text: `· via ssh (its daemon is
   down)`).
