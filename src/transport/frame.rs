@@ -10,9 +10,23 @@ pub(crate) const STDOUT: u8 = 3;
 pub(crate) const STDERR: u8 = 4;
 pub(crate) const EXIT: u8 = 5;
 pub(crate) const CANCEL: u8 = 6;
-/// Client → mux: exit now (only `mesh leave`, which deletes the state dir).
+/// Client → daemon (or an older build's mux): quit, once nothing runs (`leave`, a newer build).
 pub(crate) const QUIT: u8 = 7;
 pub(crate) const PING: u8 = 8;
+/// Client → daemon: close the SSH links (after `update`: they run the devices' old mesh).
+pub(crate) const RESET: u8 = 9;
+
+/// A shared frame writer: one lock, so frames from several threads never interleave.
+pub(crate) type Out = std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>;
+
+pub(crate) fn send(out: &Out, kind: u8, id: u32, data: &[u8]) -> io::Result<()> {
+    write(
+        &mut *out.lock().unwrap_or_else(|e| e.into_inner()),
+        kind,
+        id,
+        data,
+    )
+}
 
 /// Largest payload accepted; senders chunk stream data well below this.
 const MAX: usize = 16 << 20;

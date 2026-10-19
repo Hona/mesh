@@ -322,8 +322,8 @@ pub(crate) fn installed() -> Option<(String, Option<u32>)> {
     Some((v.unwrap_or_else(|| "?".into()), pid))
 }
 
-/// The global config document holding MCP server `name`, and its command.
-fn mcp_doc(name: &str) -> Result<Option<(PathBuf, Vec<String>)>, String> {
+/// The global config document holding MCP server `name`, and its entry.
+fn mcp_doc(name: &str) -> Result<Option<(PathBuf, serde_json::Value)>, String> {
     let bin = bin().ok_or("opencode not found")?;
     let (_, out, _) = process::output_within(
         process::command(bin)
@@ -342,35 +342,47 @@ fn mcp_doc(name: &str) -> Result<Option<(PathBuf, Vec<String>)>, String> {
         if path.parent() != Some(global.as_path()) {
             continue;
         }
-        for entry in [
-            &src["info"]["mcp"]["servers"][name],
-            &src["info"]["mcp"][name],
-        ] {
-            if let Some(cmd) = entry["command"].as_array() {
-                return Ok(Some((
-                    path,
-                    cmd.iter()
-                        .filter_map(|c| c.as_str().map(String::from))
-                        .collect(),
-                )));
-            }
+        let entry = &src["info"]["mcp"]["servers"][name];
+        if entry.is_object() {
+            return Ok(Some((path, entry.clone())));
         }
     }
     Ok(None)
 }
 
-/// Command of the global MCP server entry `name`, if any.
-pub(crate) fn mcp_entry(name: &str) -> Result<Option<Vec<String>>, String> {
-    Ok(mcp_doc(name)?.map(|(_, cmd)| cmd))
+/// The global MCP server entry `name`, if any.
+pub(crate) fn mcp_entry(name: &str) -> Result<Option<serde_json::Value>, String> {
+    Ok(mcp_doc(name)?.map(|(_, e)| e))
 }
 
-/// `opencode mcp add <name> --global -- <command…>`
-pub(crate) fn mcp_add(name: &str, command: &[&str]) -> Result<(), String> {
+/// Cut entry `name` out of the global config text (everything else stays byte for byte).
+fn mcp_cut(name: &str) -> Result<bool, String> {
+    let Some((path, _)) = mcp_doc(name)? else {
+        return Ok(false);
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let new = jsonc_remove(&text, &["mcp", "servers", name])
+        .ok_or_else(|| format!("couldn't find \"{name}\" in {}", path.display()))?;
+    std::fs::write(&path, new).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(true)
+}
+
+/// Register MCP server `name` as remote `url` in the global config, the bearer token read from
+/// `token_file` by opencode (`{file:…}`, so the config holds no secret), replacing any entry of
+/// that name; then switch every loaded location over live (`token`; no reload). Ok(locations).
+pub(crate) fn mcp_set_remote(
+    name: &str,
+    url: &str,
+    token_file: &Path,
+    token: &str,
+) -> Result<usize, String> {
+    mcp_cut(name)?;
     let bin = bin().ok_or("opencode not found")?;
+    let file = token_file.display().to_string().replace('\\', "/");
     let (ok, out, err) = process::output_within(
         process::command(bin)
-            .args(["mcp", "add", name, "--global", "--"])
-            .args(command)
+            .args(["mcp", "add", name, "--global", "--url", url, "--header"])
+            .arg(format!("Authorization=Bearer {{file:{file}}}"))
             .current_dir(paths::home()),
         SLOW,
     )
@@ -379,12 +391,23 @@ pub(crate) fn mcp_add(name: &str, command: &[&str]) -> Result<(), String> {
         let msg = String::from_utf8_lossy(&err).to_string() + &String::from_utf8_lossy(&out);
         return Err(msg.trim().to_string());
     }
-    Ok(())
+    // `mcp add` has no flag for it: no OAuth discovery for a local server
+    let (path, _) = mcp_doc(name)?.ok_or("`opencode mcp add` wrote no entry")?;
+    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let new = jsonc_prepend(&text, &["mcp", "servers", name], "\"oauth\": false, ")
+        .ok_or_else(|| format!("couldn't find \"{name}\" in {}", path.display()))?;
+    std::fs::write(&path, new).map_err(|e| format!("{}: {e}", path.display()))?;
+    let config = serde_json::json!({ "config": {
+        "type": "remote", "url": url, "oauth": false,
+        "headers": { "Authorization": format!("Bearer {token}") },
+    }});
+    Ok(each_location(name, &["experimental.mcp.add"], Some(&config.to_string())).unwrap_or(0))
 }
 
-/// Run the `api` operations `ops` for MCP server `name` in every loaded location, in parallel.
-/// None if the service isn't running or the locations can't be listed; else how many succeeded.
-fn each_location(name: &str, ops: &[&str]) -> Option<usize> {
+/// Run the `api` operations `ops` (with request body `data`) for MCP server `name` in every
+/// loaded location, in parallel. None if the service isn't running or the locations can't be
+/// listed; else how many succeeded.
+fn each_location(name: &str, ops: &[&str], data: Option<&str>) -> Option<usize> {
     let svc = service();
     if state(svc.as_ref()) != ServiceState::Ok {
         return None;
@@ -409,12 +432,12 @@ fn each_location(name: &str, ops: &[&str]) -> Option<usize> {
                 s.spawn(move || {
                     let loc = format!("location[directory]={loc}");
                     ops.iter().all(|op| {
-                        process::output_within(
-                            process::command(bin)
-                                .args(["api", op, "--param", server, "--param", &loc]),
-                            SLOW,
-                        )
-                        .is_some_and(|(ok, _, _)| ok)
+                        let mut c = process::command(bin);
+                        c.args(["api", op, "--param", server, "--param", &loc]);
+                        if let Some(d) = data {
+                            c.args(["--data", d]);
+                        }
+                        process::output_within(&mut c, SLOW).is_some_and(|(ok, _, _)| ok)
                     })
                 })
             })
@@ -428,39 +451,33 @@ fn each_location(name: &str, ops: &[&str]) -> Option<usize> {
     Some(done)
 }
 
-/// Restart MCP server `name` in every loaded opencode location so a replaced binary is used.
-/// Ok(n locations); Err(hint) if the locations can't be listed. Never `opencode reload`: it
-/// cancels the tool calls of every running session (SPEC §1.5).
-pub(crate) fn reconnect_mcp(name: &str) -> Result<usize, String> {
-    if service().is_none_or(|s| s.exe.is_none()) {
-        return Ok(0);
+/// Undo `mcp_set_remote` (mesh leave): cut the entry out of the global config text (only if
+/// `ours` says it's mesh's), then drop the running servers.
+pub(crate) fn mcp_unregister(
+    name: &str,
+    ours: &dyn Fn(&serde_json::Value) -> bool,
+) -> Result<bool, String> {
+    match mcp_entry(name)? {
+        None => return Ok(false),
+        Some(e) if !ours(&e) => {
+            return Err(format!(
+                "the \"{name}\" entry ({e}) isn't mesh's; left alone"
+            ));
+        }
+        Some(_) => {}
     }
-    each_location(
-        name,
-        &["experimental.mcp.disconnect", "experimental.mcp.connect"],
-    )
-    .ok_or_else(|| "restart opencode to load the new mesh binary".into())
+    mcp_cut(name)?;
+    let _ = each_location(name, &["experimental.mcp.remove"], None);
+    Ok(true)
 }
 
-/// Undo `mcp_add` (mesh leave): cut the entry out of the global config text (only if its command
-/// is `ours`; everything else stays byte for byte), then drop the running servers.
-pub(crate) fn mcp_unregister(name: &str, ours: &[String]) -> Result<bool, String> {
-    let Some((path, cmd)) = mcp_doc(name)? else {
-        return Ok(false);
-    };
-    if cmd != ours {
-        return Err(format!(
-            "the \"{name}\" entry ({}) isn't mesh's; left alone",
-            cmd.join(" ")
-        ));
-    }
-    let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let new = jsonc_remove(&text, &["mcp", "servers", name])
-        .or_else(|| jsonc_remove(&text, &["mcp", name]))
-        .ok_or_else(|| format!("couldn't find \"{name}\" in {}", path.display()))?;
-    std::fs::write(&path, new).map_err(|e| format!("{}: {e}", path.display()))?;
-    let _ = each_location(name, &["experimental.mcp.remove"]);
-    Ok(true)
+/// Insert `member` (e.g. `"k": v, `) first into the object member `path` of JSONC `text`.
+fn jsonc_prepend(text: &str, path: &[&str], member_text: &str) -> Option<String> {
+    let b = text.as_bytes();
+    let mut i = 0;
+    let (start, _) = member(b, &mut i, path)?;
+    let open = start + text[start..].find('{')? + 1;
+    Some(format!("{}{member_text}{}", &text[..open], &text[open..]))
 }
 
 /// Cut object member `path` out of JSONC `text` (with its line and comma); None if absent.

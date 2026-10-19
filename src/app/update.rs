@@ -3,7 +3,7 @@
 use super::exec::{self, Input};
 use super::skill::{self, Publish};
 use super::{Fail, R, VERSION, store, sync};
-use crate::host::{install, opencode, paths, process};
+use crate::host::{install, paths, process};
 use crate::model::{Envelope, RegistryConfig, State, Step, cmp_versions};
 use crate::registry;
 use std::fs;
@@ -92,11 +92,28 @@ fn install_version(version: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// sync step 3: move this device to the mesh's pin. No repo writes, no fan-out. Ok(a hint when
-/// the MCP server couldn't be restarted).
-pub(crate) fn converge(pin: &str) -> Result<Option<String>, String> {
+/// sync step 3: move this device to the mesh's pin. No repo writes, no fan-out. The daemon moves
+/// to the new binary (once its running commands are done).
+pub(crate) fn converge(pin: &str) -> Result<(), String> {
     install_version(pin.trim_start_matches('v'))?;
-    Ok(opencode::reconnect_mcp("mesh").err())
+    start_new_daemon()
+}
+
+/// Have the installed binary start its own daemon, which retires this one.
+fn start_new_daemon() -> Result<(), String> {
+    let mesh = install::dir().join(install::names()[0]);
+    match process::output_within(
+        process::command(&mesh).args(["daemon", "--start"]),
+        std::time::Duration::from_secs(20),
+    ) {
+        Some((true, _, _)) => Ok(()),
+        Some((false, out, err)) => Err(format!(
+            "daemon: {}{}",
+            String::from_utf8_lossy(&err).trim(),
+            String::from_utf8_lossy(&out).trim()
+        )),
+        None => Err("daemon: `mesh daemon --start` didn't finish in 20 s".into()),
+    }
 }
 
 pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
@@ -137,8 +154,8 @@ pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
         say("info", "releases", rel.join(" · "));
         return Ok(0);
     }
-    // Run by another device's fan-out (inside `mesh exec`): `gh` can't log in here, and the
-    // caller already pushed the pin, so this device's own sync job converges to it (§5.6 step 3).
+    // Run by another device's fan-out: the caller already pushed the pin, so a sync converges
+    // to it (§5.6 step 3).
     if std::env::var_os("MESH_FROM").is_some() && !o.resume {
         let rep = sync::run(false, false)?;
         for line in rep.changes.iter().chain(&rep.applied) {
@@ -151,14 +168,10 @@ pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
         if now != target {
             return Err(Fail(
                 1,
-                format!("still mesh {now} after its sync job (pin {target})"),
+                format!("still mesh {now} after a sync (pin {target})"),
             ));
         }
-        say(
-            "ok",
-            "binary",
-            format!("now {target} (via this device's sync job)"),
-        );
+        say("ok", "binary", format!("now {target}"));
         return Ok(0);
     }
     if target != VERSION {
@@ -183,7 +196,11 @@ pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
         return Ok(status.code().unwrap_or(1));
     }
     if o.resume {
-        exec::quit_old_muxes();
+        // this binary's daemon (and with it the MCP server) takes over
+        match super::daemon::ensure() {
+            None => say("ok", "daemon", format!("running {target}")),
+            Some(e) => say("warn", "daemon", e),
+        }
     } else {
         say("ok", "binary", format!("already {VERSION}"));
     }
@@ -192,20 +209,8 @@ pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
     if std::env::var_os("MESH_FROM").is_none() {
         publish(&state, &target, &say)?;
         failed = fan_out(&state.device, &target, &say);
-        // The fan-out's links run the devices' pre-update mesh; the next command redials.
-        exec::stop_mux();
-    }
-    // Only a swapped binary needs the MCP server restarted.
-    if o.resume {
-        match opencode::reconnect_mcp("mesh") {
-            Ok(0) => say("info", "mcp", "opencode service not running".into()),
-            Ok(n) => say(
-                "ok",
-                "mcp",
-                format!("\"mesh\" restarted on {target} ({n} opencode locations)"),
-            ),
-            Err(e) => say("warn", "mcp", e),
-        }
+        // The links run the devices' pre-update mesh; the next command redials.
+        super::daemon::reset_links();
     }
     Ok(if failed { 1 } else { 0 })
 }

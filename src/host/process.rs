@@ -428,42 +428,6 @@ impl Drop for Killer {
     }
 }
 
-/// Start a long-lived background process detached from this console/session.
-pub(crate) fn spawn_detached(
-    exe: &std::path::Path,
-    args: &[&str],
-    log: std::fs::File,
-) -> io::Result<()> {
-    let mut c = Command::new(exe);
-    c.args(args)
-        .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
-        .stderr(log);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        super::win::std_handles_private();
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP, and leave the caller's job if allowed
-        // (e.g. a tool runner that kills its job when the call ends).
-        if c.creation_flags(0x8 | 0x200 | 0x0100_0000).spawn().is_ok() {
-            return Ok(());
-        }
-        c.creation_flags(0x8 | 0x200);
-    }
-    #[cfg(unix)]
-    unsafe {
-        use std::os::unix::process::CommandExt;
-        unsafe extern "C" {
-            fn setsid() -> i32;
-        }
-        c.pre_exec(|| {
-            setsid();
-            Ok(())
-        });
-    }
-    c.spawn().map(drop)
-}
-
 /// Executable path of a live process; None if the pid is gone.
 #[cfg(windows)]
 pub(crate) fn pid_exe(pid: u32) -> Option<PathBuf> {

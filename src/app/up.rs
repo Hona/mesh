@@ -3,9 +3,11 @@
 
 use super::exec::{self, Input};
 use super::store::{self, Index};
-use super::{Fail, R, serve, skill, sync};
+use super::{Fail, R, daemon, serve, skill, sync};
 use crate::host::install::{self, Installed};
-use crate::host::{opencode, paths, process, schedule, vlog};
+#[cfg(windows)]
+use crate::host::schedule;
+use crate::host::{opencode, paths, process, vlog};
 use crate::model::{Device, Envelope, RegistryConfig, Shell, State, Step, valid_name};
 use crate::transport::ssh;
 use crate::{network, registry};
@@ -212,9 +214,6 @@ pub(crate) fn run(o: &Opts, ui: &Ui) -> R<i32> {
 
     // Preflight first: it decides the default repo and device name for the header.
     let inst = install::install(check)?;
-    if inst.changed && !check {
-        exec::quit_old_muxes();
-    }
     let path_added = install::ensure_user_path(&install::dir(), check)?;
     let login = registry::login().map_err(|e| Fail(3, e))?;
     let (oc_version, oc_pid) = opencode::installed().ok_or_else(|| {
@@ -321,6 +320,7 @@ pub(crate) fn run(o: &Opts, ui: &Ui) -> R<i32> {
             name: shell_name.clone(),
             path: shell_path.display().to_string(),
         }),
+        mcp_port: prev.as_ref().and_then(|p| p.mcp_port),
         synced: if same {
             prev.and_then(|p| p.synced)
         } else {
@@ -329,6 +329,8 @@ pub(crate) fn run(o: &Opts, ui: &Ui) -> R<i32> {
     };
     if !check {
         store::write_state(&state)?;
+        // before anything starts the daemon: it serves MCP on this port with this token
+        daemon::mcp_endpoint(true)?;
     }
     let where_ = if path.is_empty() {
         repo.clone()
@@ -426,15 +428,11 @@ pub(crate) fn run(o: &Opts, ui: &Ui) -> R<i32> {
         let _ = pushed;
     }
 
+    up.daemon();
     if o.skip.iter().any(|s| s == "mcp") {
         up.info("mcp", "skipped");
     } else {
-        up.mcp(&inst.mesh, inst.changed);
-    }
-    if o.skip.iter().any(|s| s == "schedule") {
-        up.info("schedule", "skipped");
-    } else {
-        up.schedule(&inst);
+        up.mcp();
     }
     if !check {
         up.self_test(&name);
@@ -732,42 +730,42 @@ impl Up<'_> {
         Ok(true)
     }
 
-    /// Register the MCP server; when the binary was just replaced, restart the running ones so
-    /// opencode isn't left talking to old code.
-    fn mcp(&mut self, mesh: &Path, replaced: bool) {
-        let want = vec![mesh.display().to_string(), "mcp".to_string()];
-        let restart = |up: &Self, what: &str| {
-            if up.o.check {
-                return up.ok("mcp", format!("{what} · would restart it in opencode"));
-            }
-            match opencode::reconnect_mcp("mesh") {
-                Ok(0) => up.ok("mcp", what),
-                Ok(n) => up.ok(
-                    "mcp",
-                    format!("{what} · restarted on the new binary ({n} opencode locations)"),
-                ),
-                Err(e) => up.warn("mcp", format!("{what} · {e}")),
-            }
+    /// Register the daemon's MCP endpoint as opencode's global "mesh" server (SPEC §8), live in
+    /// every loaded location.
+    fn mcp(&mut self) {
+        if self.o.check {
+            return self.info("mcp", "would register \"mesh\" (the daemon's MCP endpoint)");
+        }
+        let (port, token, file) = match daemon::mcp_endpoint(true) {
+            Ok(x) => x,
+            Err(e) => return self.fail("mcp", e),
+        };
+        let url = format!("http://127.0.0.1:{port}/mcp");
+        let file_ref = file.display().to_string().replace('\\', "/");
+        let current = |e: &serde_json::Value| {
+            e["url"].as_str() == Some(url.as_str())
+                && e["oauth"] == serde_json::Value::Bool(false)
+                && e["headers"]["Authorization"]
+                    .as_str()
+                    .is_some_and(|a| a.contains(&file_ref) || a == format!("Bearer {token}"))
         };
         match opencode::mcp_entry("mesh") {
-            Ok(Some(cmd)) if cmd == want && replaced => restart(self, "\"mesh\" registered"),
-            Ok(Some(cmd)) if cmd == want => self.ok("mcp", "\"mesh\" registered"),
+            Ok(Some(e)) if current(&e) => self.ok("mcp", format!("\"mesh\" registered · {url}")),
             Ok(existing) => {
                 if let Some(other) = existing {
                     let q = format!(
-                        "opencode has a different \"mesh\" MCP server ({}). Replace it? [y/n]",
-                        other.join(" ")
+                        "opencode has a different \"mesh\" MCP server ({other}). Replace it? [y/n]"
                     );
                     if self.choose(&q, "yn", 'y') == 'n' {
                         self.warn("mcp", "kept the existing \"mesh\" entry");
                         return;
                     }
                 }
-                if self.o.check {
-                    return self.info("mcp", "would register \"mesh\"");
-                }
-                match opencode::mcp_add("mesh", &[&want[0], "mcp"]) {
-                    Ok(()) => restart(self, "registered \"mesh\""),
+                match opencode::mcp_set_remote("mesh", &url, &file, &token) {
+                    Ok(n) => self.ok(
+                        "mcp",
+                        format!("registered \"mesh\" · {url} · live in {n} opencode locations"),
+                    ),
                     Err(e) => self.fail("mcp", e),
                 }
             }
@@ -775,17 +773,16 @@ impl Up<'_> {
         }
     }
 
-    fn schedule(&mut self, inst: &Installed) {
-        let every = schedule::parse_interval(store::mesh().interval.as_deref());
-        let exe = inst.meshw.clone().unwrap_or_else(|| inst.mesh.clone());
-        let what = format!("sync every {}m", every / 60);
-        match schedule::ensure_sync(&exe, every, self.o.check) {
-            Ok(schedule::Outcome::Unchanged) => self.ok("schedule", what),
-            Ok(schedule::Outcome::Installed) => self.ok(
-                "schedule",
-                self.would(&what, &format!("would set up {what}")),
-            ),
-            Err(e) => self.fail("schedule", e),
+    /// The daemon (SPEC §6.6): autostart registered, this build running.
+    fn daemon(&mut self) {
+        let what = "starts at login, kept running";
+        match daemon::install(self.o.check) {
+            Ok(_) if self.o.check => self.info("daemon", format!("would run · {what}")),
+            Ok(_) => match daemon::ensure() {
+                None => self.ok("daemon", format!("running · {what}")),
+                Some(e) => self.fail("daemon", e),
+            },
+            Err(e) => self.fail("daemon", e),
         }
     }
 

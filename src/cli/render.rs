@@ -65,7 +65,7 @@ pub(crate) fn status_text(s: &Status) -> String {
     };
     let mut rows = vec![
         [
-            "DEVICE", "OS", "SHELL", "ONLINE", "OPENCODE", "BUSY", "MESH",
+            "DEVICE", "OS", "SHELL", "ONLINE", "OPENCODE", "BUSY", "DAEMON", "MESH",
         ]
         .map(String::from),
     ];
@@ -104,10 +104,11 @@ pub(crate) fn status_text(s: &Status) -> String {
             }),
             oc.and_then(|o| o.busy)
                 .map_or("-".into(), |b| b.to_string()),
+            d.daemon.clone().unwrap_or_else(|| "-".into()),
             mesh,
         ]);
     }
-    let widths: Vec<usize> = (0..7)
+    let widths: Vec<usize> = (0..8)
         .map(|i| rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0))
         .collect();
     let mut text = String::new();
@@ -157,6 +158,9 @@ pub(crate) fn exec_text(results: &[ExecResult]) -> String {
         }
         if let Some(e) = &r.error {
             head += &format!(" · {e}");
+        }
+        if r.via.as_deref() == Some("ssh") {
+            head += " · via ssh (its daemon is down)";
         }
         if r.truncated == Some(true) {
             head += " · truncated";

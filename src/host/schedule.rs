@@ -1,18 +1,18 @@
-//! Periodic background jobs (SPEC §7.2, §7.3): Task Scheduler, systemd user timer, LaunchAgent.
+//! Background jobs (SPEC §7.2, §7.3): the daemon's autostart (Task Scheduler, systemd user
+//! service, LaunchAgent) and the elevated Windows keys task.
 
 use super::paths;
 use super::process::command;
 use std::path::Path;
 
 #[cfg(windows)]
-pub(crate) const SYNC_TASK: &str = r"\opencode-mesh\sync";
-#[cfg(windows)]
 pub(crate) const KEYS_TASK: &str = r"\opencode-mesh\keys";
-/// On demand, no trigger: runs queued durable commands in the user's own logon (SPEC §5.5).
 #[cfg(windows)]
-pub(crate) const RUN_TASK: &str = r"\opencode-mesh\run";
-#[cfg(windows)]
-const RUN_ARGS: &str = "exec self --run-queued";
+pub(crate) const DAEMON_TASK: &str = r"\opencode-mesh\daemon";
+#[cfg(target_os = "linux")]
+const DAEMON_UNIT: &str = "opencode-mesh.service";
+#[cfg(target_os = "macos")]
+const DAEMON_LABEL: &str = "opencode-mesh.daemon";
 
 #[derive(PartialEq)]
 pub(crate) enum Outcome {
@@ -53,29 +53,33 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
-/// `every_secs` None: no trigger (started with `schtasks /run`), parallel instances, no time limit.
+/// Every `every_secs`; `daemon`: also at this user's logon, parallel instances (a new build
+/// starts while the old one finishes its commands; a second one of the same build just exits),
+/// no time limit, normal priority (what it starts inherits it).
 #[cfg(windows)]
 fn task_xml(
     exe: &Path,
     args: &str,
-    every_secs: Option<u64>,
+    every_secs: u64,
+    daemon: bool,
     elevated: bool,
 ) -> Result<String, String> {
     let sid = super::win::user_sid().ok_or("can't read the user SID")?;
-    let (triggers, instances, limit) = match every_secs {
-        Some(s) => (
-            format!(
-                "<TimeTrigger>
+    let mut triggers = format!(
+        "<TimeTrigger>
       <Repetition><Interval>PT{}M</Interval><StopAtDurationEnd>false</StopAtDurationEnd></Repetition>
       <StartBoundary>2020-01-01T00:00:00</StartBoundary>
       <Enabled>true</Enabled>
     </TimeTrigger>",
-                (s / 60).max(1)
-            ),
-            "IgnoreNew",
-            "PT10M",
-        ),
-        None => (String::new(), "Parallel", "PT0S"),
+        (every_secs / 60).max(1)
+    );
+    let (instances, limit, priority) = if daemon {
+        triggers += &format!(
+            "\n    <LogonTrigger><Enabled>true</Enabled><UserId>{sid}</UserId></LogonTrigger>"
+        );
+        ("Parallel", "PT0S", "\n    <Priority>5</Priority>")
+    } else {
+        ("IgnoreNew", "PT10M", "")
     };
     let (logon, level, sd) = if elevated {
         // S4U: runs whether or not the user is logged on; the user may read and run it.
@@ -104,7 +108,7 @@ fn task_xml(
     <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
     <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
     <StartWhenAvailable>true</StartWhenAvailable>
-    <ExecutionTimeLimit>{limit}</ExecutionTimeLimit>
+    <ExecutionTimeLimit>{limit}</ExecutionTimeLimit>{priority}
     <Enabled>true</Enabled>
   </Settings>
   <Actions Context="Author">
@@ -145,7 +149,7 @@ pub(crate) fn ensure_task(
     if check {
         return Ok(Outcome::Installed);
     }
-    create(name, &task_xml(exe, args, Some(every_secs), elevated)?).map(|_| Outcome::Installed)
+    create(name, &task_xml(exe, args, every_secs, false, elevated)?).map(|_| Outcome::Installed)
 }
 
 #[cfg(windows)]
@@ -160,46 +164,75 @@ fn create(name: &str, xml: &str) -> Result<(), String> {
     r.map(drop)
 }
 
-/// Start the run task (creating or fixing it first if it doesn't run `meshw`).
+/// The daemon's autostart: at logon, kept alive every `every_secs` (a running one makes the
+/// new instance exit at once).
 #[cfg(windows)]
-pub(crate) fn start_run_task(meshw: &Path) -> Result<(), String> {
-    if !task_matches_cmd(RUN_TASK, meshw, RUN_ARGS) {
-        create(RUN_TASK, &task_xml(meshw, RUN_ARGS, None, false)?)?;
+pub(crate) fn ensure_daemon(meshw: &Path, every_secs: u64, check: bool) -> Result<Outcome, String> {
+    if task_matches(DAEMON_TASK, meshw, "daemon", every_secs) {
+        return Ok(Outcome::Unchanged);
     }
-    run_task(RUN_TASK)
+    if check {
+        return Ok(Outcome::Installed);
+    }
+    create(
+        DAEMON_TASK,
+        &task_xml(meshw, "daemon", every_secs, true, false)?,
+    )
+    .map(|_| Outcome::Installed)
 }
 
-#[cfg(windows)]
-fn task_matches_cmd(name: &str, exe: &Path, args: &str) -> bool {
-    run(command("schtasks").args(["/query", "/tn", name, "/xml"])).is_ok_and(|xml| {
-        xml.contains(&format!(
-            "<Command>{}</Command>",
-            xml_escape(&exe.display().to_string())
-        )) && xml.contains(&format!("<Arguments>{args}</Arguments>"))
-    })
-}
-
-/// Start this user's sync job now, without waiting (it runs in the user's own logon, where the
-/// OS credential store, and so `gh`, works; an SSH session can't reach it).
-pub(crate) fn start_sync() -> Result<(), String> {
+/// Start the daemon now (no-op where one already runs, except that a new build retires it).
+pub(crate) fn start_daemon() -> Result<(), String> {
     #[cfg(windows)]
-    let r = run(command("schtasks").args(["/run", "/tn", SYNC_TASK]));
+    let r = run(command("schtasks").args(["/run", "/tn", DAEMON_TASK]));
     #[cfg(target_os = "linux")]
-    let r = run(command("systemctl").args([
-        "--user",
-        "start",
-        "--no-block",
-        "opencode-mesh-sync.service",
-    ]));
+    let r = run(command("systemctl").args(["--user", "start", DAEMON_UNIT]));
     #[cfg(target_os = "macos")]
-    let r = {
-        unsafe extern "C" {
-            fn getuid() -> u32;
-        }
-        let label = format!("gui/{}/opencode-mesh.sync", unsafe { getuid() });
-        run(command("launchctl").args(["kickstart", &label]))
-    };
+    let r = run(command("launchctl").args(["kickstart", &format!("{}/{DAEMON_LABEL}", gui())]));
     r.map(drop)
+}
+
+#[cfg(target_os = "macos")]
+fn gui() -> String {
+    unsafe extern "C" {
+        fn getuid() -> u32;
+    }
+    format!("gui/{}", unsafe { getuid() })
+}
+
+#[cfg(target_os = "linux")]
+fn unit_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| paths::home().join(".config"))
+        .join("systemd/user")
+}
+
+/// Undo `ensure_daemon` (mesh leave). Ok(false) if there was nothing to remove.
+pub(crate) fn remove_daemon() -> Result<bool, String> {
+    #[cfg(windows)]
+    return remove_task(DAEMON_TASK);
+    #[cfg(target_os = "linux")]
+    {
+        let unit = unit_dir().join(DAEMON_UNIT);
+        if !unit.exists() {
+            return Ok(false);
+        }
+        let _ = run(command("systemctl").args(["--user", "disable", "--now", DAEMON_UNIT]));
+        std::fs::remove_file(&unit).map_err(|e| format!("{}: {e}", unit.display()))?;
+        let _ = run(command("systemctl").args(["--user", "daemon-reload"]));
+        Ok(true)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let plist = paths::home().join(format!("Library/LaunchAgents/{DAEMON_LABEL}.plist"));
+        if !plist.exists() {
+            return Ok(false);
+        }
+        let _ = run(command("launchctl").args(["bootout", &format!("{}/{DAEMON_LABEL}", gui())]));
+        std::fs::remove_file(&plist).map_err(|e| format!("{}: {e}", plist.display()))?;
+        Ok(true)
+    }
 }
 
 /// Delete a task; Ok(false) if it didn't exist.
@@ -215,7 +248,7 @@ pub(crate) fn remove_task(name: &str) -> Result<bool, String> {
 #[cfg(windows)]
 pub(crate) fn remove_keys_task() -> Result<bool, String> {
     let removed = remove_task(KEYS_TASK)?;
-    let _ = remove_task(SYNC_TASK);
+    let _ = remove_task(DAEMON_TASK);
     let script = "$s = New-Object -ComObject Schedule.Service; $s.Connect(); \
         try { $s.GetFolder('\\').DeleteFolder('opencode-mesh', 0) } catch {}";
     let _ =
@@ -223,55 +256,9 @@ pub(crate) fn remove_keys_task() -> Result<bool, String> {
     Ok(removed)
 }
 
-/// Undo `ensure_sync` (mesh leave). Ok(false) if there was nothing to remove.
-#[cfg(windows)]
-pub(crate) fn remove_sync() -> Result<bool, String> {
-    let _ = remove_task(RUN_TASK);
-    remove_task(SYNC_TASK)
-}
-
-#[cfg(target_os = "linux")]
-pub(crate) fn remove_sync() -> Result<bool, String> {
-    let dir = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| paths::home().join(".config"))
-        .join("systemd/user");
-    let timer = dir.join("opencode-mesh-sync.timer");
-    if !timer.exists() {
-        return Ok(false);
-    }
-    let _ =
-        run(command("systemctl").args(["--user", "disable", "--now", "opencode-mesh-sync.timer"]));
-    let _ = std::fs::remove_file(timer);
-    let _ = std::fs::remove_file(dir.join("opencode-mesh-sync.service"));
-    let _ = run(command("systemctl").args(["--user", "daemon-reload"]));
-    Ok(true)
-}
-
-#[cfg(target_os = "macos")]
-pub(crate) fn remove_sync() -> Result<bool, String> {
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    let plist = paths::home().join("Library/LaunchAgents/opencode-mesh.sync.plist");
-    if !plist.exists() {
-        return Ok(false);
-    }
-    let label = format!("gui/{}/opencode-mesh.sync", unsafe { getuid() });
-    let _ = run(command("launchctl").args(["bootout", &label]));
-    std::fs::remove_file(&plist).map_err(|e| format!("{}: {e}", plist.display()))?;
-    Ok(true)
-}
-
 #[cfg(windows)]
 pub(crate) fn run_task(name: &str) -> Result<(), String> {
     run(command("schtasks").args(["/run", "/tn", name])).map(drop)
-}
-
-/// The periodic `sync` job for this user.
-#[cfg(windows)]
-pub(crate) fn ensure_sync(meshw: &Path, every_secs: u64, check: bool) -> Result<Outcome, String> {
-    ensure_task(SYNC_TASK, meshw, "sync", every_secs, false, check)
 }
 
 #[cfg(unix)]
@@ -288,45 +275,36 @@ fn write_if_changed(p: &Path, text: &str, check: bool) -> Result<bool, String> {
     Ok(true)
 }
 
+/// systemd user service, restarted whenever it exits. `KillMode=process`: stopping or
+/// restarting it ends only the daemon, never what its commands started.
 #[cfg(target_os = "linux")]
-pub(crate) fn ensure_sync(mesh: &Path, every_secs: u64, check: bool) -> Result<Outcome, String> {
-    let dir = std::env::var_os("XDG_CONFIG_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| paths::home().join(".config"))
-        .join("systemd/user");
-    let log = paths::state_dir().join("log").join("sync.log");
+pub(crate) fn ensure_daemon(mesh: &Path, _every_secs: u64, check: bool) -> Result<Outcome, String> {
+    let log = paths::state_dir().join("log").join("daemon.log");
     let service = format!(
-        "[Unit]\nDescription=opencode mesh sync\n\n[Service]\nType=oneshot\nExecStart=\"{}\" sync\nStandardOutput=append:{}\nStandardError=append:{}\n",
+        "[Unit]\nDescription=opencode mesh daemon\n\n[Service]\nExecStart=\"{}\" daemon\nRestart=always\nRestartSec=1\nKillMode=process\nStandardOutput=append:{}\nStandardError=append:{}\n\n[Install]\nWantedBy=default.target\n",
         mesh.display(),
         log.display(),
         log.display()
     );
-    let timer = format!(
-        "[Unit]\nDescription=opencode mesh sync\n\n[Timer]\nOnBootSec=1min\nOnUnitActiveSec={every_secs}s\n\n[Install]\nWantedBy=timers.target\n"
-    );
-    let a = write_if_changed(&dir.join("opencode-mesh-sync.service"), &service, check)?;
-    let b = write_if_changed(&dir.join("opencode-mesh-sync.timer"), &timer, check)?;
-    if !(a || b) {
+    if !write_if_changed(&unit_dir().join(DAEMON_UNIT), &service, check)? {
         return Ok(Outcome::Unchanged);
     }
     if !check {
         let _ = std::fs::create_dir_all(log.parent().unwrap_or(Path::new(".")));
         run(command("systemctl").args(["--user", "daemon-reload"]))?;
-        run(command("systemctl").args(["--user", "enable", "--now", "opencode-mesh-sync.timer"]))?;
+        run(command("systemctl").args(["--user", "enable", DAEMON_UNIT]))?;
     }
     Ok(Outcome::Installed)
 }
 
+/// LaunchAgent: at login, and again whenever it exits.
 #[cfg(target_os = "macos")]
-pub(crate) fn ensure_sync(mesh: &Path, every_secs: u64, check: bool) -> Result<Outcome, String> {
-    unsafe extern "C" {
-        fn getuid() -> u32;
-    }
-    let plist = paths::home().join("Library/LaunchAgents/opencode-mesh.sync.plist");
+pub(crate) fn ensure_daemon(mesh: &Path, _every_secs: u64, check: bool) -> Result<Outcome, String> {
+    let plist = paths::home().join(format!("Library/LaunchAgents/{DAEMON_LABEL}.plist"));
     let log = xml_escape(
         &paths::state_dir()
             .join("log")
-            .join("sync.log")
+            .join("daemon.log")
             .display()
             .to_string(),
     );
@@ -334,10 +312,10 @@ pub(crate) fn ensure_sync(mesh: &Path, every_secs: u64, check: bool) -> Result<O
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>opencode-mesh.sync</string>
-  <key>ProgramArguments</key><array><string>{}</string><string>sync</string></array>
-  <key>StartInterval</key><integer>{every_secs}</integer>
+  <key>Label</key><string>{DAEMON_LABEL}</string>
+  <key>ProgramArguments</key><array><string>{}</string><string>daemon</string></array>
   <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
 </dict></plist>
@@ -348,9 +326,8 @@ pub(crate) fn ensure_sync(mesh: &Path, every_secs: u64, check: bool) -> Result<O
         return Ok(Outcome::Unchanged);
     }
     if !check {
-        let domain = format!("gui/{}", unsafe { getuid() });
-        let _ =
-            run(command("launchctl").args(["bootout", &format!("{domain}/opencode-mesh.sync")]));
+        let domain = gui();
+        let _ = run(command("launchctl").args(["bootout", &format!("{domain}/{DAEMON_LABEL}")]));
         run(command("launchctl").args(["bootstrap", &domain, &plist.display().to_string()]))?;
     }
     Ok(Outcome::Installed)

@@ -1,8 +1,8 @@
-//! `mesh exec` (SPEC §5.5): through the local mux (§6.5) when possible, else the one-shot
-//! SSH handoff (§6.2). Callers get a stream of events and render them.
+//! `mesh exec` (SPEC §5.5): through the daemon's mux (§6.5, started on demand) when possible,
+//! else the one-shot SSH handoff (§6.2). Callers get a stream of events and render them.
 
-use super::{Fail, R, VERSION, serve, store, sync};
-use crate::host::{install, ipc, paths, process};
+use super::{Fail, R, serve, store, sync};
+use crate::host::{paths, process};
 use crate::model::{Device, Envelope, ExecResult, ExitInfo, Target};
 use crate::network;
 use crate::transport::frame::{CANCEL, EXIT, START, STDERR, STDIN, STDOUT};
@@ -46,55 +46,6 @@ pub(crate) fn targets(target: &str, exclude: Option<&str>) -> R<(String, Vec<Dev
     };
     devices.retain(|d| names.contains(&d.name));
     Ok((state.device, devices))
-}
-
-pub(crate) fn hello() -> Vec<u8> {
-    format!(r#"{{"v":1,"mesh":"{VERSION}","build":"{BUILD}"}}"#).into_bytes()
-}
-
-/// This build's mux: each build has its own endpoint, so builds never fight over one.
-fn mux_client() -> Option<mux::Client> {
-    let connect = || mux::Client::connect(BUILD).filter(|c| c.hello == hello());
-    if let Some(c) = connect() {
-        return Some(c);
-    }
-    quit_old_muxes();
-    let exe = install::installed_copy().or_else(|| std::env::current_exe().ok())?;
-    let log = store::log_file("mux", &format!("start {}", exe.display()))?;
-    process::spawn_detached(&exe, &["mux"], log).ok()?;
-    for _ in 0..300 {
-        std::thread::sleep(Duration::from_millis(5));
-        if let Some(c) = connect() {
-            return Some(c);
-        }
-    }
-    None
-}
-
-/// Ask this build's mux to exit (mesh leave deletes the state dir it logs into).
-pub(crate) fn stop_mux() {
-    if let Some(c) = mux::Client::connect(BUILD) {
-        c.quit();
-    }
-}
-
-/// Ask muxes of older builds to exit: new clients can't reach them, so they'd only hold links,
-/// remote serve processes and their (renamed-aside) exe. Newer builds' muxes are left alone, so
-/// a stale old client can never knock out a newer mux. Ok(how many were asked).
-pub(crate) fn quit_old_muxes() -> usize {
-    let build = |hello: &[u8]| {
-        let v: serde_json::Value = serde_json::from_slice(hello).unwrap_or_default();
-        u128::from_str_radix(v["build"].as_str().unwrap_or("0"), 16).unwrap_or(0)
-    };
-    let mine = u128::from_str_radix(BUILD, 16).unwrap_or(0);
-    let mut asked = 0;
-    for tag in ipc::endpoints().into_iter().filter(|t| t != BUILD) {
-        if let Some(c) = mux::Client::connect(&tag).filter(|c| build(&c.hello) < mine) {
-            c.quit();
-            asked += 1;
-        }
-    }
-    asked
 }
 
 /// Feed `input` to `sink` on its own thread; an empty chunk means EOF.
@@ -143,7 +94,8 @@ fn via_mux(
                 i,
                 ExitInfo {
                     code: Some(255),
-                    error: Some("mux connection lost".into()),
+                    error: Some("daemon connection lost".into()),
+                    via: None,
                 },
                 0,
             ));
@@ -198,9 +150,9 @@ impl Read for Tail {
     }
 }
 
-/// Inside an SSH session on Windows (a nested `mesh exec`), ssh.exe misbehaves with pipes: with
-/// a stdin pipe it relays output only while stdin has data, with a stdout pipe it never exits.
-/// So no mux; one-shot with the envelope in argv, stdin null, output through files.
+/// Inside an SSH session on Windows, ssh.exe misbehaves with std's pipes: with a stdin pipe it
+/// relays output only while stdin has data, with a stdout pipe it never exits. So the fallback
+/// there puts the envelope in argv, stdin null, output through files.
 fn nested() -> bool {
     cfg!(windows)
         && (std::env::var_os("SSH_CONNECTION").is_some()
@@ -220,6 +172,7 @@ fn via_ssh(me: &str, devices: &[Device], env: &Envelope, input: Input, tx: Sende
                 ExitInfo {
                     code: Some(255),
                     error: Some(e),
+                    via: None,
                 },
                 0,
             )
@@ -334,6 +287,7 @@ fn via_ssh(me: &str, devices: &[Device], env: &Envelope, input: Input, tx: Sende
                 ExitInfo {
                     code: Some(code),
                     error: None,
+                    via: None,
                 },
                 0,
             ));
@@ -371,7 +325,7 @@ pub(crate) fn run(
         ..env.clone()
     };
     let (tx, rx) = mpsc::channel();
-    let client = match (!nested()).then(mux_client).flatten() {
+    let client = match super::daemon::connect(true) {
         Some(c) => Some(via_mux(c, me, devices, env, input, tx)),
         None => {
             via_ssh(me, devices, env, input, tx);
@@ -412,6 +366,7 @@ pub(crate) fn run(
                         ExitInfo {
                             code: Some(255),
                             error: Some(msg.into()),
+                            via: None,
                         },
                         ms,
                     ));
@@ -549,6 +504,7 @@ pub(crate) fn capture(
             r.exit = info.code;
             r.ms = Some(ms);
             r.error = info.error;
+            r.via = info.via;
         }
     });
     for (r, (out, err)) in results.iter_mut().zip(caps) {

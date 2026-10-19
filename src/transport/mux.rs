@@ -1,14 +1,14 @@
-//! The local mux (SPEC §6.5): one persistent `exec self --serve` link per device, shared by
-//! every local mesh process over the local socket. Frames from clients are routed to the
-//! device link with the ids rewritten; replies are routed back.
+//! The mux (SPEC §6.5), inside the daemon: one persistent `exec self --serve` link per device,
+//! shared by every local mesh process over the daemon's socket. Frames from clients are routed
+//! to the device link with the ids rewritten; replies are routed back.
 
-use super::frame::{self, CANCEL, EXIT, HELLO, PING, QUIT, START, STDERR, STDIN, STDOUT};
+use super::frame::{self, CANCEL, EXIT, HELLO, Out, PING, QUIT, START, STDERR, STDIN, STDOUT};
 use crate::host::ipc::{self, Conn};
 use crate::model::{Envelope, ExitInfo};
 use std::collections::HashMap;
 use std::io::{self, BufReader, Read};
 use std::process::{Child, ChildStdin};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -23,25 +23,26 @@ pub(crate) fn exit_frame(code: i32, error: Option<String>) -> Vec<u8> {
     serde_json::to_vec(&ExitInfo {
         code: Some(code),
         error,
+        via: None,
     })
     .unwrap_or_default()
 }
 
 /// A local process connected to the mux.
 struct Peer {
-    conn: Arc<Conn>,
-    w: Mutex<()>,
+    out: Out,
 }
 
 impl Peer {
     fn send(&self, kind: u8, id: u32, data: &[u8]) -> io::Result<()> {
-        let _g = lock(&self.w);
-        frame::write(&mut &*self.conn, kind, id, data)
+        frame::send(&self.out, kind, id, data)
     }
 }
 
 /// A link quiet for this long gets pinged before reuse (sleep/resume, network changes).
 const QUIET: Duration = Duration::from_secs(20);
+/// A link nothing used for this long is closed (the remote serve process exits with it).
+const IDLE: Duration = Duration::from_secs(600);
 
 /// One device's persistent link.
 struct Link {
@@ -52,6 +53,8 @@ struct Link {
     alive: AtomicBool,
     last_rx: Mutex<Instant>,
     ping_sent: Mutex<Option<Instant>>,
+    /// Last command started or output relayed.
+    last_use: Mutex<Instant>,
 }
 
 impl Link {
@@ -81,18 +84,35 @@ impl Link {
     }
 }
 
-struct Mux {
+pub(crate) struct Mux {
     dial: Dial,
     links: Mutex<HashMap<String, Arc<Link>>>,
     dialing: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    clients: AtomicUsize,
-    last: Mutex<Instant>,
-    hello: Vec<u8>,
 }
 
 impl Mux {
-    fn touch(&self) {
-        *lock(&self.last) = Instant::now();
+    /// A mux; a background thread pings quiet links and closes idle ones.
+    pub(crate) fn new(dial: Dial) -> Arc<Mux> {
+        let mux = Arc::new(Mux {
+            dial,
+            links: Mutex::new(HashMap::new()),
+            dialing: Mutex::new(HashMap::new()),
+        });
+        let m = mux.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(10));
+                m.watch();
+            }
+        });
+        mux
+    }
+
+    /// Close every link (their remote ends run an old mesh after `update`).
+    pub(crate) fn reset(&self) {
+        for (_, l) in lock(&self.links).drain() {
+            l.kill();
+        }
     }
 
     /// A usable link: alive, and answering a ping if it has been quiet a while.
@@ -114,6 +134,10 @@ impl Mux {
     fn watch(&self) {
         let links: Vec<Arc<Link>> = lock(&self.links).values().cloned().collect();
         for l in links {
+            if lock(&l.routes).is_empty() && lock(&l.last_use).elapsed() > IDLE {
+                l.kill();
+                continue;
+            }
             if lock(&l.last_rx).elapsed() < QUIET {
                 continue;
             }
@@ -196,6 +220,7 @@ impl Mux {
             alive: AtomicBool::new(true),
             last_rx: Mutex::new(Instant::now()),
             ping_sent: Mutex::new(None),
+            last_use: Mutex::new(Instant::now()),
         });
         lock(&self.links).insert(dev.to_string(), link.clone());
         let (mux, l, name) = (self.clone(), link.clone(), dev.to_string());
@@ -213,10 +238,10 @@ impl Mux {
                 EXIT => lock(&link.routes).remove(&f.id),
                 _ => None,
             };
-            // Only output for a client is activity; ping replies must not keep the mux alive.
+            // Only output for a client is activity; ping replies must not keep a link open.
             if let Some((peer, id)) = route {
                 let _ = peer.send(f.kind, id, &f.data);
-                self.touch();
+                *lock(&link.last_use) = Instant::now();
             }
         }
         link.alive.store(false, Ordering::Relaxed);
@@ -247,52 +272,50 @@ impl Mux {
         }
     }
 
-    /// Client -> devices, until the client disconnects; then cancel what it left running.
-    fn client(self: &Arc<Self>, conn: Arc<Conn>) {
-        let peer = Arc::new(Peer {
-            conn: conn.clone(),
-            w: Mutex::new(()),
-        });
-        let _ = peer.send(HELLO, 0, &self.hello);
+    /// One local connection, until it closes; then cancel what it left running. A START naming
+    /// a `device` goes to that device's link; every other frame goes to `local` (commands for
+    /// this machine, pings, quit), which writes its replies to `out` as well.
+    pub(crate) fn client(
+        self: &Arc<Self>,
+        input: impl Read,
+        out: Out,
+        local: &mut dyn FnMut(frame::Frame),
+    ) {
+        let peer = Arc::new(Peer { out });
         let mut mine: HashMap<u32, (Arc<Link>, u32)> = HashMap::new();
-        let mut r = BufReader::with_capacity(frame::CHUNK, &*conn);
+        let mut r = BufReader::with_capacity(frame::CHUNK, input);
         while let Ok(Some(f)) = frame::read(&mut r) {
-            self.touch();
-            match f.kind {
-                START => {
-                    let dev = serde_json::from_slice::<Envelope>(&f.data)
-                        .ok()
-                        .and_then(|e| e.device);
-                    let link = dev
-                        .ok_or_else(|| "start without a device".to_string())
-                        .and_then(|d| self.link(&d));
-                    match link {
-                        Ok(link) => {
-                            let rid = link.next.fetch_add(1, Ordering::Relaxed);
-                            lock(&link.routes).insert(rid, (peer.clone(), f.id));
-                            if link.send(START, rid, &f.data).is_err() {
-                                lock(&link.routes).remove(&rid);
-                                let _ = peer.send(
-                                    EXIT,
-                                    f.id,
-                                    &exit_frame(255, Some("connection lost".into())),
-                                );
-                            } else {
-                                mine.insert(f.id, (link, rid));
-                            }
-                        }
-                        Err(e) => {
-                            let _ = peer.send(EXIT, f.id, &exit_frame(255, Some(e)));
+            let dev = (f.kind == START)
+                .then(|| serde_json::from_slice::<Envelope>(&f.data).ok())
+                .flatten()
+                .and_then(|e| e.device);
+            match (f.kind, dev) {
+                (START, Some(d)) => match self.link(&d) {
+                    Ok(link) => {
+                        let rid = link.next.fetch_add(1, Ordering::Relaxed);
+                        *lock(&link.last_use) = Instant::now();
+                        lock(&link.routes).insert(rid, (peer.clone(), f.id));
+                        if link.send(START, rid, &f.data).is_err() {
+                            lock(&link.routes).remove(&rid);
+                            let _ = peer.send(
+                                EXIT,
+                                f.id,
+                                &exit_frame(255, Some("connection lost".into())),
+                            );
+                        } else {
+                            mine.insert(f.id, (link, rid));
                         }
                     }
-                }
-                STDIN | CANCEL => {
+                    Err(e) => {
+                        let _ = peer.send(EXIT, f.id, &exit_frame(255, Some(e)));
+                    }
+                },
+                (STDIN | CANCEL, _) if mine.contains_key(&f.id) => {
                     if let Some((link, rid)) = mine.get(&f.id) {
                         let _ = link.send(f.kind, *rid, &f.data);
                     }
                 }
-                QUIT => std::process::exit(0),
-                _ => {}
+                _ => local(f),
             }
         }
         for (link, rid) in mine.into_values() {
@@ -300,56 +323,23 @@ impl Mux {
                 let _ = link.send(CANCEL, rid, &[]);
             }
         }
-        self.clients.fetch_sub(1, Ordering::Relaxed);
-        self.touch();
     }
 }
 
-/// Run the mux until it has been idle (no clients) for `idle`.
-pub(crate) fn serve(listener: ipc::Listener, dial: Dial, idle: Duration, hello: Vec<u8>) {
-    let mux = Arc::new(Mux {
-        dial,
-        links: Mutex::new(HashMap::new()),
-        dialing: Mutex::new(HashMap::new()),
-        clients: AtomicUsize::new(0),
-        last: Mutex::new(Instant::now()),
-        hello,
-    });
-    let m = mux.clone();
-    std::thread::spawn(move || {
-        loop {
-            std::thread::sleep(Duration::from_secs(10));
-            m.watch();
-            if m.clients.load(Ordering::Relaxed) == 0 && lock(&m.last).elapsed() >= idle {
-                std::process::exit(0);
-            }
-        }
-    });
-    while let Ok(conn) = listener.accept() {
-        mux.clients.fetch_add(1, Ordering::Relaxed);
-        mux.touch();
-        let m = mux.clone();
-        std::thread::spawn(move || m.client(Arc::new(conn)));
-    }
-}
-
-/// A local process's connection to the mux.
+/// A local process's connection to the daemon (SPEC §6.6).
 pub(crate) struct Client {
     conn: Arc<Conn>,
     w: Mutex<()>,
-    /// The mux's hello payload.
-    pub hello: Vec<u8>,
 }
 
 impl Client {
-    /// Connect to the running mux of build `tag`; None if there is none.
+    /// Connect to the endpoint `tag`; None if nothing answers there.
     pub(crate) fn connect(tag: &str) -> Option<Client> {
         let conn = Arc::new(ipc::connect(tag).ok()??);
         let f = frame::read(&mut &*conn).ok()??;
         (f.kind == HELLO).then(|| Client {
             conn,
             w: Mutex::new(()),
-            hello: f.data,
         })
     }
 
@@ -358,7 +348,7 @@ impl Client {
         frame::write(&mut &*self.conn, kind, id, data)
     }
 
-    /// Ask this build's mux to exit (mesh leave).
+    /// Ask it to quit once idle.
     pub(crate) fn quit(&self) {
         let _ = self.send(QUIT, 0, &[]);
     }

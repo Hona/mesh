@@ -42,7 +42,9 @@ When a design change is agreed, update this file in the same change.
     all of it while they're at the device. After that nothing prompts; `sync`/`status` only
     report problems.
 11. **One concept, one name.** Each MCP tool is exactly a CLI command: same name, same
-    arguments, same JSON as `--json`.
+    arguments (MCP `script` = CLI `-s`), same JSON as `--json`.
+12. **No backwards compatibility while pre-1.0.** Breaking changes are fine; clean up old
+    installs by hand or re-run `up`. No migration code, no handling of older builds' formats.
 
 ## 2. Invariants (assumed on every device)
 
@@ -149,23 +151,23 @@ State dir: `~/.local/share/opencode-mesh/` (respect `XDG_DATA_HOME`) on Linux/ma
 ```
 state.json        # { "registry": { "kind": "github", "repo", "path", "branch" },
                   #   "device", "shell": { "name": "pwsh", "path": "<abs path>" },
-                  #   "synced": "<commit sha>" }
+                  #   "synced": "<commit sha>", "mcp_port": 47474 }
 sync.lock         # held during a sync (pid inside; taken over if that process is gone)
-sync.result       # how the last sync ended (report or error), for a remote `mesh sync` (§5.6)
-run/              # Windows: durable commands queued for the run task, their logs (§5.5)
-mux-<build>.sock  # Linux/macOS: the mux's local socket, one per build (dir is 0700)
+run/              # temp script files for `exec -s` on PowerShell / cmd (§5.5)
+daemon-<build>.sock  # Linux/macOS: the daemon's local socket, one per build (dir is 0700)
+mcp-token         # the MCP bearer token (§8), readable by this user only
 id_ed25519(.pub)  # this device's mesh key (permissions locked to the user)
 ssh_config        # generated; used via `ssh -F` for every mesh connection
 known_hosts       # generated from devices/*.host.pub
 cache/            # last pulled copy of the mesh repo + per-file sha index
 backup/<time>/    # backups of anything mesh replaced (AGENTS.md, conflicting skills)
-log/              # background run logs
+log/              # daemon.log, sync.log (rotated at 1 MB)
 ```
 
 Installed binary: `~/.local/bin/mesh` (Linux/macOS; if that isn't on PATH, one marked line in the
 `$SHELL` profile adds it, §5.3); `%LOCALAPPDATA%\Programs\mesh\{mesh,meshw}.exe` (Windows, added
 to user PATH).
-Everything internal (MCP registration, remote handoff, scheduled tasks) uses absolute paths.
+Everything internal (remote handoff, the daemon's autostart) uses absolute paths.
 
 ### 4.5 Architecture (`src/`)
 
@@ -174,18 +176,20 @@ One package `mesh`: a library plus thin binaries.
 ```
 lib.rs          module declarations only
 main.rs         bin `mesh`: parse args → app → exit code
-bin/meshw.rs    bin `meshw`, Windows windowless build (Phase 2)
+bin/meshw.rs    bin `meshw`, Windows windowless build (starts the daemon, the elevated step)
 cli/            argument parsing, help, text + JSON rendering
 app/            commands (sync, status, up, exec, …): orchestration only
+                → daemon.rs (§6.6), serve.rs (running commands; the relay)
 model/          plain data: Mesh, Device, Target, State, reports
 registry/       where the mesh lives            → github.rs (the only place that runs `gh`)
 network/        how devices are found / online  → tailscale.rs (the only place that runs `tailscale`)
-transport/      how commands reach devices      → ssh.rs; mux.rs, frame.rs (§6.5, Phase 3)
-host/           this machine's OS integration   → paths, processes, admin check, opencode discovery
-mcp/            stdio MCP server (§8, Phase 3)
+transport/      how commands reach devices      → ssh.rs; mux.rs, frame.rs (§6.5)
+host/           this machine's OS integration   → paths, processes, local sockets, autostart, opencode
+mcp/            MCP server (§8): JSON-RPC, Streamable HTTP for the daemon, stdio (hidden)
 ```
 
-- `cli` → `app` → `registry`, `network`, `transport`, `host`, `model`.
+- `cli`, `mcp` → `app` → `registry`, `network`, `transport`, `host`, `model`. The daemon gets
+  its MCP server passed in by `cli` (`app` never calls `mcp`).
 - Backends (`registry`, `network`, `transport`, `host`) depend only on `model` (and `host` for
   paths), never on `app`/`cli` or on each other's internals. They return `model` types, never raw
   `gh`/`tailscale` JSON.
@@ -201,7 +205,7 @@ mesh <command> [flags]
 
 Setup      up · sync · rm · leave · update
 Use        status · exec · cp
-Internal   mcp
+Internal   daemon · mcp (hidden)
 Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version
 ```
 
@@ -254,7 +258,7 @@ mesh up [--repo <owner/name>] [--path <dir>] [--name <device>] [--public]
 | `--upload-skill` | `<id>[,<id>…]`, repeatable: upload these local skills to the mesh (the only non-interactive way) |
 | `--check` | report what would change; change nothing |
 | `--wait` | after joining, poll until peers have synced and accept this device |
-| `--skip` | skip steps: `sshd`, `mcp`, `schedule` |
+| `--skip` | skip steps: `sshd`, `mcp` |
 
 Steps (each checks first, prints ✓ / ! / ✗):
 
@@ -268,13 +272,18 @@ Steps (each checks first, prints ✓ / ! / ✗):
    authorized-keys file.
 5. **Conflicts** (joining an existing mesh) — §7.4: `AGENTS.md` and local skills.
 6. **Device** — write `devices/<name>.{json,pub,host.pub}` in one commit (explicit push).
-7. **Sync** — §5.6.
-8. **MCP** — `opencode mcp add mesh --global -- <abs mesh path> mcp`. If a different `mesh`
-   MCP entry exists, ask. If `up` just replaced the installed binary, restart the running `mesh`
-   MCP servers so none keeps old code: `opencode api experimental.mcp.disconnect` / `connect`
-   (`server=mesh`) in every loaded location (`debug.location.list`; if that fails:
-   `! mcp  restart opencode to load the new mesh binary`).
-9. **Schedule** — §7.2.
+7. **Sync** — §5.6. Before it, the MCP endpoint is fixed: `state.json` `mcp_port` (47474, or
+   the next free port up to +99; kept once chosen) and `<state>/mcp-token` (32 random bytes,
+   hex, user-only file).
+8. **Daemon** — §6.6: autostart registered (§7.2), this build's daemon running (it retires
+   other builds' daemons once they're idle).
+9. **MCP** — the global opencode entry `mesh` = `{"type": "remote", "url":
+   "http://127.0.0.1:<port>/mcp", "oauth": false, "headers": {"Authorization": "Bearer
+   {file:<state>/mcp-token>}"}}`: `opencode mcp add mesh --global --url … --header …`, then
+   `"oauth": false` written into that entry (no flag for it). opencode reads the token from the
+   file, so the config holds no secret (no service environment to set). Then the same entry,
+   token inline, goes live in every loaded location with `opencode api experimental.mcp.add`
+   (`debug.location.list`): no reload. A different `mesh` entry: ask before replacing it.
 10. **Self-test** — via the mesh SSH config to itself: `mesh exec self opencode --version`
     over SSH. Then `exec` a no-op on each online peer; peers that haven't synced yet are
     reported as "pending (≤ interval)".
@@ -285,7 +294,7 @@ Steps (each checks first, prints ✓ / ! / ✗):
     Linux/macOS: when `~/.local/bin` isn't on PATH, one line ending `# opencode-mesh: PATH` in
     the `$SHELL` profile: `~/.zshrc`, `~/.bashrc` (macOS `~/.bash_profile`),
     `~/.config/fish/conf.d/opencode-mesh.fish`, else `~/.profile`). The running opencode
-    service, its agents' shells and the MCP servers it starts keep the old PATH, so `up` runs
+    service and its agents' shells keep the old PATH, so `up` runs
     `opencode service restart` (the service's own binary, with the install dir added to PATH)
     when that cuts nothing off and can work: `up` isn't running inside opencode (`OPENCODE` /
     `OPENCODE_SESSION_ID` unset; opencode sets them for everything it starts), not in an SSH
@@ -315,8 +324,8 @@ mesh up · Hona/opencode-mesh · adais
   ? AGENTS.md  differs from the mesh  [k]eep mesh / [u]pload this / [e]dit
   ✓ device     devices/adais.{json,pub,host.pub} pushed
   ✓ sync       3 devices · 2 skills
-  ✓ mcp        registered "mesh"
-  ✓ schedule   sync every 10m
+  ✓ daemon     running · starts at login, kept running
+  ✓ mcp        registered "mesh" · http://127.0.0.1:47474/mcp · live in 6 opencode locations
   ✓ self-test  adais → opencode 2.0.32
   … peers      blade, air accept adais after their next sync (≤10m)
 ```
@@ -334,14 +343,14 @@ mesh status [<target>] [--fast] [--json]
 Default target `all`. Without `--fast`, each online device is probed in parallel over the
 handoff (§6.2) by running `mesh status self --json` there, which reports local facts:
 opencode version + the service state (below), busy session count (`opencode api
-session.active`, only asked of a service that answers), mesh version. `--fast` uses only the
-repo cache + Tailscale.
+session.active`, only asked of a service that answers), daemon `up` / `down` (a connect to its
+socket, no spawn), mesh version. `--fast` uses only the repo cache + Tailscale.
 
 ```
-DEVICE   OS       SHELL       ONLINE  OPENCODE  BUSY  MESH
-adais *  windows  pwsh        yes     2.0.32    0     0.1.0
-blade    windows  powershell  yes     2.0.32    1     0.1.0
-air      macos    zsh         no      -         -     -
+DEVICE   OS       SHELL       ONLINE  OPENCODE  BUSY  DAEMON  MESH
+adais *  windows  pwsh        yes     2.0.32    0     up      0.1.0
+blade    windows  powershell  yes     2.0.32    1     up      0.1.0
+air      macos    zsh         no      -         -     -       -
 ```
 
 Also shows: pending binary updates (`0.1.0 → 0.2.0 (pending)`), a customised mesh skill,
@@ -364,7 +373,6 @@ The service state (JSON `opencode.service`) is shown when it isn't `ok`, e.g.
 A raw `TcpStream` with timeouts, no `opencode` spawn. `status` never hangs on a broken opencode:
 every opencode spawn mesh makes (version, busy, config, MCP restarts) has a hard limit
 (3 s for status probes, 20 s otherwise) and is skipped when the service doesn't answer.
-Older devices send `service: true|false` (read as `ok` / `down`).
 
 A running desktop app owns its service and starts it again by itself (verified on Blade): within
 ~1 s after `opencode service stop`, a little later after a kill; `opencode service start` then
@@ -376,7 +384,7 @@ for a few seconds right after MCP restarts).
 Run a command on devices.
 
 ```
-mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--durable] [--no-stall] [--json] <target> <cmd> [args…]
+mesh exec [-t] [-w <dir>] [-e KEY=VAL]... [--timeout <s>] [--no-stall] [--json] <target> <cmd> [args…]
 mesh exec [flags] <target> -c '<string>'
 mesh exec [flags] <target> -s            # script on stdin
 ```
@@ -401,40 +409,32 @@ mesh exec [flags] <target> -s            # script on stdin
 - The tree is killed **only** on timeout, cancel (Ctrl-C, MCP cancel) or the client going away
   mid-command. A command that exits by itself leaves what it started running (Windows: the job
   stops being kill-on-close; it allows breakaway).
-- `--durable` (MCP `durable: true`): what the command starts must also outlive the SSH
-  session (mux idle exit, network drop). Windows sshd kills its session job, and a breakaway
-  lands in an outer job it kills too, so the command is queued in `<state>/run/` and run by the
-  user-context `\opencode-mesh\run` task (no trigger, parallel instances, created on first use),
-  in the logged-on user's session; its output (stdout and stderr merged, no stdin) is relayed
-  live and the exit code returned. Same kill rule: timeout, cancel or the serving process gone.
-  Nobody logged on: fails with `not logged in …` (nothing ran). Linux: wrapped in
-  `systemd-run --user --scope` when the user bus is up (out of the login session logind may
-  reap; linger keeps the user manager; verified on the Debian VPS: the process lands in
-  `user@0.service/app.slice/run-*.scope`). macOS: runs as is. `opencode service start|restart`
-  is always durable.
+- Commands run in the device's daemon (§6.6), in the user's own login session: what they start
+  outlives the SSH session, and the OS credential store (`gh`'s login) works. Their environment
+  is the SSH session's (fresh PATH and all), minus `SSH_*` / `XDG_SESSION_*`. Daemon
+  unreachable (nobody logged on, crashed and not restartable): they run in the SSH session as a
+  fallback. Each result says where: `"via": "daemon" | "ssh"` (text: `· via ssh (its daemon is
+  down)`).
 - **Stall**: a command with no output whose process tree has used < 1% CPU and done no I/O for
   20 s (sampled every 5 s: job accounting on Windows, the process group's `/proc` stat + io on
   Linux; macOS: not detected) is killed: exit 124, `error: "stalled"`, `hint: "no output and
   idle for 20 s; is it waiting for input?"`, the output so far; the CLI prints `mesh: <device>:
   stalled: <hint>`. Not while stdin is still streaming in, not with `-t`. One timer per link (a
-  thread per one-shot / durable command). Opt out: `--no-stall` (MCP `stall: false`).
+  thread per one-shot command). Opt out: `--no-stall` (MCP `stall: false`).
   Internal execs (`status`, `update`, `cp`, `up`) don't ask for it.
 - **Plain output**: non-`-t` commands get `NO_COLOR=1` and `TERM=dumb` (before `-e`; PowerShell
   7.2+ then renders `PlainText`). `--json` / MCP results drop ANSI escape sequences and turn
   CRLF into LF; the live CLI stream is raw.
-- Windows: the serving side gives a command's stdio named pipes opened for overlapped I/O (like
-  sshd's own), not std's synchronous anonymous pipes: with those, Win32-OpenSSH's `ssh.exe`
-  inside an SSH session prints nothing while its stdin is open and never exits with a stdout
-  pipe (`mesh exec blade ssh vps uname` hung until the timeout; now 0.6 s).
+- Windows: a command's stdio are named pipes opened for overlapped I/O (like sshd's own), not
+  std's synchronous anonymous pipes: with those, Win32-OpenSSH's `ssh.exe` inside an SSH
+  session prints nothing while its stdin is open and never exits with a stdout pipe.
 - A target naming a device missing from the cache runs one sync first (§5.1).
-- The remote process gets `MESH_FROM=<calling device>`.
-- Nested (`mesh exec` run inside a `mesh exec` on a Windows device): no mux, one-shot SSH per
-  device with the envelope hex-encoded in argv, stdin null, and stdout/stderr to files in
-  `<state>/run/` that are tailed live. ssh.exe inside an SSH session misbehaves with pipes
-  (stdin pipe: relays output only while it has data; stdout pipe: never exits), so a mux
-  started there stalls. The nested command gets no stdin.
-- For long-lived background commands: `--durable` with the command's own way to background
-  (`Start-Process`, `nohup … &`), or opencode's shells (`opencode api shell.create …`).
+- The remote process gets `MESH_FROM=<calling device>` (and `MESH_SESSION`, §8.2).
+- Without a daemon to reach, inside an SSH session on Windows (the fallback above): one-shot SSH
+  per device with the envelope hex-encoded in argv, stdin null, and stdout/stderr to files in
+  `<state>/run/` that are tailed live (ssh.exe's pipe trouble, above). No stdin.
+- Long-lived background commands: the command's own way to background (`Start-Process`,
+  `nohup … &`), or opencode's shells (`opencode api shell.create …`).
 
 ```sh
 mesh exec blade opencode run "fix the failing test"
@@ -451,9 +451,11 @@ JSON result (also the MCP `exec` result):
 ```jsonc
 {
   "results": [
-    { "device": "blade", "exit": 0, "ms": 1210, "stdout": "…", "stderr": "", "truncated": false },
+    { "device": "blade", "exit": 0, "ms": 1210, "stdout": "…", "stderr": "", "truncated": false,
+      "via": "daemon" },
     { "device": "vps", "exit": 124, "ms": 20210, "stdout": "", "stderr": "", "truncated": false,
-      "error": "stalled", "hint": "no output and idle for 20 s; is it waiting for input?" },
+      "error": "stalled", "hint": "no output and idle for 20 s; is it waiting for input?",
+      "via": "daemon" },
     { "device": "air", "error": "offline" }
   ]
 }
@@ -478,18 +480,17 @@ Pull-only. Never writes to the repo.
    - `<state>/ssh_config` from `devices/*.json` + current Tailscale IPs (`tailscale status --json`);
    - skills → `~/.config/opencode/skills/opencode-mesh/` (mesh-owned folder, replaced wholesale);
    - `AGENTS.md` → `~/.config/opencode/AGENTS.md` (§7.4).
-3. If `mesh.json` `pin` differs from this binary's version, self-update to the pin (§5.9 step 1
-   + MCP restart; either direction, no repo writes). Leftover `*.old` binaries are deleted.
+3. If `mesh.json` `pin` differs from this binary's version, self-update to the pin (§5.9 step
+   1; either direction, no repo writes), then run `<installed mesh> daemon --start`: the new
+   build's daemon starts and the old one quits once its commands are done (§6.6). Leftover
+   `*.old` binaries are deleted.
 
-Prints a short diff (`+ device air`, `~ skill review`, …). Runs on schedule and lazily when a
-target names an unknown device.
+Before anything else (not for `--keys-only`), a sync makes sure this build's daemon answers
+(else registers its autostart and starts it, §6.6).
 
-Inside `mesh exec` (an SSH session, `MESH_FROM` set) the OS credential store, and so `gh`'s
-login, is out of reach on Windows and macOS (Linux: no secret service). There, `sync` starts the
-device's own sync job (`\opencode-mesh\sync` task, `launchctl kickstart`, `systemctl --user
-start`), waits for its `sync.result` (up to 5 min) and reports that. A job that doesn't start
-within 20 s means the user isn't logged on (Windows runs it only then): it fails with
-`<device>: not logged in …; it syncs on its next run`. `--force` doesn't carry over.
+Prints a short diff (`+ device air`, `~ skill review`, …). The daemon runs it every `interval`
+(§6.6); also run lazily when a target names an unknown device. A remote `mesh exec <device>
+mesh sync` runs in that device's daemon like any command, so `gh` is logged in there.
 
 ### 5.7 `mesh cp`
 
@@ -514,17 +515,17 @@ mesh leave [--yes]           # this device
 ```
 
 `leave`: delete own `devices/*` (commit), then undo all local setup — MCP registration
-(`opencode api experimental.mcp.remove`), scheduled tasks, the managed keys block, the
+(`opencode api experimental.mcp.remove`), the daemon's autostart, the managed keys block, the
 opt-in `Include` line, the marked PATH line in shell profiles (Linux/macOS),
-`skills/opencode-mesh/`, the state dir (incl. key). Leaves
+`skills/opencode-mesh/`, the state dir (incl. key and token). Leaves
 `~/.config/opencode/AGENTS.md`, an installed SSH server and the mesh binaries in place.
 
 - `experimental.mcp.remove` only drops the running server, and the config API can't delete
-  entries, so `leave` cuts its own `mesh` entry (only if its command is mesh's) out of the
+  entries, so `leave` cuts its own `mesh` entry (only if its URL is this daemon's) out of the
   global config text, leaving every other byte as is, then removes it in every loaded location.
 - Admin Windows: the keys block and the `\opencode-mesh\keys` task need one UAC prompt (the
-  same elevated step as `up`). This build's mux is told to quit (frame `7`) before the state
-  dir is deleted.
+  same elevated step as `up`). The daemons are told to quit (frame `7`) before the state dir is
+  deleted.
 - `rm` refuses this device (use `leave`); without a terminal both need `--yes`.
 
 ### 5.9 `mesh update`
@@ -540,11 +541,10 @@ One command updates the whole mesh:
    `mesh.exe`/`meshw.exe` to `*.old`, write new, delete `*.old` on a later run).
 2. Set `pin` in `mesh.json` and push (explicit). Push `skills/mesh/SKILL.md` if newer (§9).
 3. `mesh exec all mesh update --version <v>` for online devices; offline ones converge on
-   their next sync (they see `pin`). Then the local mux is told to quit: its links still run
-   the devices' pre-update mesh, so the next command redials.
-4. On each device, reconnect the MCP server so the new binary is used
-   (`opencode api experimental.mcp.disconnect` / `connect` for `mesh`, in every loaded
-   location, as in §5.3 step 8).
+   their next sync (they see `pin`). Then the local daemon closes its SSH links (frame `9`):
+   they still run the devices' pre-update mesh, so the next command redials.
+4. On each device the new build's daemon takes over (§5.6 step 3); MCP clients keep working:
+   each MCP request is a separate HTTP POST (§8), so nothing in opencode needs reconnecting.
 
 Devices never move to "latest" on their own — only to the pinned version.
 `--version` also rolls back. `--check` shows what's available. Without `--version`, "latest"
@@ -553,18 +553,16 @@ is the highest release, counting prereleases only when this build is one.
 - Step 1 downloads `mesh-<os>-<arch>[.exe]` (+ `meshw-…` on Windows) and `SHA256SUMS` into
   `<state>/update/`, then swaps them in at the §4.4 install path. Steps 2–4 run in the new
   binary (`mesh update --version <v> --resume`), so the skill it pushes is the new one.
-- Run on a device by another device's step 3 (`MESH_FROM` is set), `update` downloads nothing
-  itself (`gh` can't log in there, §5.6): the caller already pushed the pin, so it runs the
-  device's own sync job, which converges to it (§5.6 step 3, incl. the MCP restart), and
-  reports the new version. No repo writes, no further fan-out. Devices on 0.1.0-dev.5 or older
-  don't have this and need their own sync job to run once (≤ interval).
+- Run on a device by another device's step 3 (`MESH_FROM` is set), `update` runs a sync there:
+  the caller already pushed the pin, so it converges to it (§5.6 step 3), and reports the new
+  version. No repo writes, no further fan-out.
 - Pin and skill go in one commit; nothing is committed when both are already current.
-`mesh update` and the exec handoff stay backward compatible, so a new binary can always tell
-an old one to update.
+- No compatibility across breaking releases (§1.12): re-run `up` on each device instead.
 
-### 5.10 `mesh mcp`
+### 5.10 `mesh daemon` / `mesh mcp` (hidden)
 
-Stdio MCP server (§8). Started by opencode.
+`mesh daemon`: §6.6 (`--start`: make sure this build's daemon runs, after a binary swap).
+`mesh mcp`: the same MCP server on stdio (§8), for debugging; not registered anywhere.
 
 ## 6. Transport
 
@@ -600,15 +598,15 @@ The first stdin line is a JSON envelope; everything after it is passed to the ch
 { "v": 1, "from": "adais",
   "argv": ["opencode", "api", "session.active"],   // or "command": "<string>" (-c), "script" (-s)
   "cwd": "D:\\Hona\\app", "env": { "K": "V" }, "tty": false, "timeout": 120,
-  "stdin": false,     // nothing streams: the command's stdin is the null device (absent = true)
+  "stdin": true,      // the client streams stdin (absent: the command's stdin is the null device)
   "stall": true }     // stall detection (absent = off)
 ```
 
-- The remote side is just `mesh exec self`: it resolves `opencode`/`mesh`, sets `MESH_FROM`,
-  enforces the timeout, and execs the argv directly (no shell) or the string via the device's
-  shell.
-- stdout/stderr ride SSH's own channels; the exit status is SSH's exit status. No framing.
-- Unknown envelope fields are ignored; a higher major `v` fails with an upgrade message.
+- The remote side is just `mesh exec self`, a relay (§6.6): it hands the envelope to the
+  daemon (or runs it itself, the fallback), which resolves `opencode`/`mesh`, sets
+  `MESH_FROM`, enforces the timeout, and execs the argv directly (no shell) or the string via
+  the device's shell.
+- stdout/stderr go to SSH's own channels; the exit status is SSH's exit status.
 - `-t` mode: `ssh -t … exec self --envelope <hex>`: the envelope travels hex-encoded as an
   argument (only `[0-9a-f]`, safe in every shell) because stdin is the terminal.
 
@@ -640,44 +638,78 @@ with spaces it's double-quoted (cmd, the default). Unix: single-quoted.
 
 Only `version`, `url`, `pid` are read from `service.json` — never `password`.
 
-### 6.5 Persistent connections (Phase 3)
+### 6.5 Persistent connections (the mux, inside the daemon)
 
-- A local background `mesh` process (the "mux") starts on first use, keeps one SSH connection
-  per device, and exits after ~10 min idle.
-- Each connection runs the remote mesh in a long-lived serve mode that handles many concurrent
-  commands over the one SSH channel.
-- Binary length-prefixed frames per command id: `start` (envelope), `stdin`, `stdout`,
-  `stderr`, `exit`, `cancel`.
-- CLI invocations and the MCP server talk to the local mux over a local socket (named pipe on
-  Windows, unix socket elsewhere).
+- The daemon (§6.6) keeps one SSH connection per device ("link"), dialed lazily, closed after
+  10 min without commands or output (link pings don't count).
+- Each link runs the remote mesh's relay, `mesh exec self --serve`, which handles many
+  concurrent commands over the one SSH channel.
+- CLI invocations talk to the local daemon over its socket; if it doesn't answer they start it
+  (§6.6) and wait up to 3 s, else fall back to a direct one-shot `ssh` (the §6.2 handoff). The
+  daemon's own MCP calls go through its socket too.
 - Goal: after the first command, each exec costs one network round trip + the command's own
   startup. No SSH handshake and no remote shell startup per command (Windows SSH runs every
   command through the default shell; PowerShell costs 0.3–0.8 s).
-- `-t` interactive sessions keep using plain `ssh -t`. If the mux can't start, fall back to a
-  direct one-shot `ssh` (the §6.2 handoff).
+- `-t` interactive sessions keep using plain `ssh -t` (and run in the SSH session).
 
 Details:
 
-- The mux is the hidden `mesh mux`, spawned detached by the first client (no console, its own
-  process group, out of the caller's job when allowed; logs to `log/mux.log`). One mux per
-  build: Windows pipe `\\.\pipe\opencode-mesh-<user SID>-<build id>`, DACL = that user only,
-  remote clients rejected; unix `<state>/mux-<build id>.sock`. Different builds never share a
-  mux. A mux exits after 10 min without clients and without command output (link pings don't
-  count); when it exits, its SSH links close and the remote `exec self --serve` processes exit
-  on EOF. A starting mux, and `up`/`update` after installing, ask this user's muxes from
-  *older* builds to quit (frame `7`; endpoints found by name prefix, incl. the pre-per-build
-  name); newer builds' muxes are never touched, so a stale old client can't knock out a new one.
-- The remote side is the hidden `mesh exec self --serve`; links are dialed lazily per device
-  (offline devices fail at once; no hello within 15 s = failed).
+- Links: offline devices fail at once; no hello within 15 s = failed.
 - Frame: `[kind u8][id u32 LE][len u32 LE][len bytes]`. Kinds: `0 hello` (JSON, first frame
-  each way the server speaks), `1 start` (envelope JSON; to the mux it also carries `device`),
-  `2 stdin` (empty = EOF), `3 stdout`, `4 stderr`, `5 exit` (JSON `{code, error?}`), `6 cancel`
-  (kill the tree), `7 quit` (client → mux: `leave`, and newer builds retiring older muxes),
-  `8 ping` (echoed). Stream chunks ≤ 64 KiB. The mux
-  rewrites ids between clients and links; a client that disconnects cancels its commands.
+  each way the server speaks), `1 start` (envelope JSON; one with `device` goes to that
+  device's link, one without runs on this device), `2 stdin` (empty = EOF), `3 stdout`,
+  `4 stderr`, `5 exit` (JSON `{code, error?, via?}`), `6 cancel` (kill the tree), `7 quit`
+  (client → daemon: quit once idle), `8 ping` (echoed), `9 reset` (client → daemon: close the
+  links). Stream chunks ≤ 64 KiB. The mux rewrites ids between clients and links; a client
+  that disconnects cancels its commands.
 - Dead links: a link quiet for 20 s is pinged before reuse (one round trip; no answer in 3 s →
   redial transparently). The mux also pings quiet links and kills one that doesn't answer
   within 10 s; its in-flight commands end with exit 255 `connection to <device> lost`.
+
+### 6.6 The daemon
+
+One long-lived mesh process per user and device, `mesh daemon` (hidden), in the user's own
+login session. It is the only mesh process on a device (plus commands' transient children):
+
+```
+caller ──ssh──▶ sshd ──▶ mesh exec self --serve   (relay, inside the SSH session)
+                                 │ local socket, this user only
+                                 ▼
+                           mesh daemon  (user's login session)
+                                 ├─▶ starts the commands
+                                 ├─ mux: SSH links to other devices (§6.5)
+                                 ├─ MCP server, http://127.0.0.1:<port>/mcp (§8)
+                                 └─ sync every `interval` (a `mesh sync` child; first after 1 min)
+```
+
+- **Socket**: per build, Windows pipe `\\.\pipe\opencode-mesh-<user SID>-daemon-<build id>`
+  (DACL = that user only, remote clients rejected), unix `<state>/daemon-<build id>.sock`
+  (state dir 0700). Hello `{"v":1,"mesh":…,"build":…}`.
+- **Relay**: `exec self --serve` connects to its build's daemon and hands it each START with the
+  SSH session's environment (`relay_env`, the command's base environment) and no `device`;
+  stdin, cancel, output and exit pass through. `--envelope` (one-shot) does the same for its one
+  command. `-t` runs in the SSH session. If the daemon doesn't answer, the relay starts it
+  (registering its autostart if missing, ≤ 3 s; after a failed start, again only after a
+  minute) and otherwise runs the command itself in the SSH session (`via: "ssh"`). The daemon
+  going away mid-command ends that command with exit 255 `the daemon went away`.
+- **Commands**: exactly as §5.5 (overlapped pipes on Windows, job object / process group,
+  timeout, stall, `NO_COLOR`/`TERM=dumb`, `MESH_FROM`, scripts, `opencode`/`mesh` resolution;
+  `mesh` = the console build next to the daemon, `PATH` lookups use the relayed PATH). The tree
+  is killed only on timeout, cancel, stall or the relay's connection closing mid-command.
+- **Windows console**: the autostart runs the windowless `meshw.exe daemon`, which starts
+  `mesh.exe daemon` with `CREATE_NO_WINDOW` (a console without a window; out of the task's job
+  when allowed; output to `log/daemon.log`) and exits. Commands inherit that console instead of
+  each getting a new conhost: spawning `hostname` measured 9.8 vs 19.7 ms in the user's
+  session.
+- **One per user**: a daemon that can't bind its socket (this build already runs) exits. A
+  starting daemon asks every other build's daemon to quit (frame `7`); a daemon told to quit
+  exits as soon as no command runs (it still serves its existing connections until then).
+- **Taking over after a new binary** (`daemon --start`, `update`, `up`, a relay or sync that
+  finds no daemon of its build): register the autostart, then Windows: run the task (a new
+  instance; it retires the old); Linux/macOS: ask the old daemon to quit and start the unit
+  (systemd/launchd starts the new binary once the old one exits).
+- **Idle cost**: blocked threads, a 10 s link-watch tick, the sync timer. Measured idle private
+  memory: see §12.
 
 ## 7. Setup details
 
@@ -689,29 +721,26 @@ Adapt to what exists; never reconfigure an existing server.
 |---|---|---|
 | Windows | One UAC: install OpenSSH Server capability, start it, set Automatic | Pick the `exec -c` shell (§4.2; sshd's DefaultShell is left untouched); detect effective keys file (parse `sshd_config` incl. `Match Group administrators`; membership counts even when not elevated); the one UAC also creates the admin keys file (Administrators + SYSTEM only, no inheritance) and the `keys` task (§7.3) when needed |
 | macOS | Open Sharing settings; user turns on **Remote Login** | Also require **"Allow full disk access for remote users"** (otherwise remote commands can't read `~/Documents`, `~/Desktop`); open the exact pane, wait, re-verify via SSH to self |
-| Linux | One sudo: install via detected package manager | `loginctl enable-linger $USER` (user timers survive logout); detect login shell |
+| Linux | One sudo: install via detected package manager | `loginctl enable-linger $USER` (the user service survives logout); detect login shell |
 
 The device's `.host.pub` is read from the server's `ssh_host_ed25519_key.pub`; where that needs
 admin to read (Windows), `up` asks the running server instead (`ssh-keyscan 127.0.0.1`).
 The one elevated step on Windows is `meshw elevated <hex plan>` via a single UAC prompt; if it's
 declined or unanswered `up` exits 3 and prints the exact command to run in an admin terminal.
 
-### 7.2 Scheduling
+### 7.2 Scheduling: the daemon's autostart
 
-Runs `mesh sync` every `interval`, as the user, no admin:
+The daemon (§6.6) starts at login and is kept running, as the user, no admin. Its own timer
+runs the periodic sync.
 
 | OS | Mechanism |
 |---|---|
-| Linux | systemd user timer `opencode-mesh-sync.timer` |
-| macOS | LaunchAgent `opencode-mesh.sync` |
-| Windows | Task Scheduler `\opencode-mesh\sync`, "run only when user is logged on", action `meshw.exe sync` |
+| Linux | systemd user service `opencode-mesh.service`: `ExecStart=<mesh> daemon`, `Restart=always`, `RestartSec=1`, `KillMode=process` (stopping the daemon never kills what its commands started), `WantedBy=default.target` (linger keeps it running without a login) |
+| macOS | LaunchAgent `opencode-mesh.daemon`: `RunAtLoad`, `KeepAlive` |
+| Windows | Task Scheduler `\opencode-mesh\daemon`, "run only when user is logged on": at this user's logon and every `interval` (a running daemon makes that instance exit at once), parallel instances, no time limit, priority 5 (normal: commands inherit it), action `meshw.exe daemon` |
 
 `meshw.exe` is the windowless (`windows_subsystem = "windows"`) build of the same code — the
-`pythonw.exe` / `javaw.exe` convention. Background runs log to `<state>/log/`.
-
-Windows also has `\opencode-mesh\run` (same principal, no trigger, parallel instances, no time
-limit, action `meshw.exe exec self --run-queued`) for durable commands (§5.5); created on first
-use, removed by `leave`.
+`pythonw.exe` / `javaw.exe` convention. Logs go to `<state>/log/`.
 
 ### 7.3 Authorized keys
 
@@ -754,14 +783,26 @@ ssh-ed25519 AAAA… opencode-mesh:air
 
 ## 8. MCP server
 
-- Server name `mesh`; stdio; newline-delimited JSON-RPC 2.0; hand-rolled.
+- Server name `mesh`, served by the daemon (§6.6), JSON-RPC 2.0, hand-rolled. One server per
+  device for every opencode location (no process per location).
+- **Transport**: Streamable HTTP, minimal: `POST http://127.0.0.1:<port>/mcp` with one JSON-RPC
+  message → `200 application/json` with the response (`202`, empty, for notifications). No SSE:
+  `GET` → `405`. Stateless (no `Mcp-Session-Id`): a daemon restart is invisible to clients
+  between requests, so updates need no reconnect.
+- **Security** (local server): bound to `127.0.0.1` only; a request with an `Origin` other than
+  absent/`null` → `403`; `Host` other than `127.0.0.1:<port>` / `localhost:<port>` → `403`
+  (DNS rebinding); `Content-Type` not `application/json` → `415`; `Authorization` other than
+  `Bearer <token>` → `401`, compared in constant time. Token: `<state>/mcp-token`, 32 random
+  bytes (OS RNG) as hex, readable by the user only (unix 0600; Windows inheritance cut, the
+  user only). opencode sends it from the config entry `"Bearer {file:<token path>}"` (§5.3
+  step 9). Limits: 64 KiB of headers, 16 MiB body.
+- `mesh mcp` (hidden) serves the same on stdio (newline-delimited) for debugging.
 - Methods: `initialize`, `notifications/initialized`, `ping`, `tools/list`, `tools/call`.
 - Tool results: `content` (readable text for the model) + `structuredContent` (same JSON as
   the CLI's `--json`). `isError` only for mesh-level errors (bad arguments); per-device
   failures live in `results`.
-- `instructions` (one line, from the local cache, plus the server's own absolute path, which
-  works before a new PATH reaches opencode's shells; `up` restarts the server, so it's there at
-  once):
+- `instructions` (one line, from the local cache, plus the console build's absolute path, which
+  works before a new PATH reaches opencode's shells):
   `Opencode mesh: devices adais (windows), blade (windows), air (macos). Load the "mesh" skill before using mesh tools. CLI: C:\Users\Lukem\AppData\Local\Programs\mesh\mesh.exe`
 - The built-in skill says: if `mesh` isn't on PATH, use that CLI path.
 
@@ -776,27 +817,30 @@ ssh-ed25519 AAAA… opencode-mesh:air
   "devices": [
     { "name": "blade", "self": false, "os": "windows", "arch": "x64", "shell": "powershell",
       "user": "lukem", "online": true, "reachable": true, "latency_ms": 38,
-      "opencode": { "version": "2.0.32", "busy": 1, "service": "ok" }, "mesh": "0.1.0" } ] }
+      "opencode": { "version": "2.0.32", "busy": 1, "service": "ok" }, "daemon": "up",
+      "mesh": "0.1.0" } ] }
 // "service": "ok" | "down" | "stale" | "hung" (§5.4)
 ```
 
 ### 8.2 `exec`
 
 ```jsonc
-// input — exactly one of argv | command | script
+// input — exactly one of argv | script
 { "target":    { "type": "string" },                                 // required
-  "argv":      { "type": "array", "items": { "type": "string" } },   // no shell
-  "command":   { "type": "string" },                                 // device's shell (-c)
-  "script":    { "type": "string" },                                 // device's shell (-s); not with stdin
+  "argv":      { "type": "array", "items": { "type": "string" } },   // one program, exact args, no shell; fastest
+  "script":    { "type": "string" },                                 // device's shell code, any length (-s); not with stdin
   "stdin":     { "type": "string" },                                 // absent: stdin is the null device
   "stall":     { "type": "boolean", "default": true },               // §5.5
   "cwd":       { "type": "string" },
   "env":       { "type": "object", "additionalProperties": { "type": "string" } },
   "timeout":   { "type": "number", "default": 120 },                 // seconds
-  "max_bytes": { "type": "number", "default": 50000 },               // per stream, keeps head + tail
-  "durable":   { "type": "boolean", "default": false } }             // §5.5
+  "max_bytes": { "type": "number", "default": 50000 } }              // per stream, keeps head + tail
 // output: §5.5 JSON result
 ```
+
+The calling session, `params._meta["ai.opencode/sessionID"]`, reaches the remote command as
+`MESH_SESSION` (unless `env` sets it), next to `MESH_FROM`, to trace work back to a session.
+The field descriptions in `tools/list` explain argv vs script on their own.
 
 Text rendering for the model:
 
@@ -809,11 +853,13 @@ Text rendering for the model:
 ## 9. Built-in skill
 
 - Source: `skill/SKILL.md` in this repo, embedded into the binary.
-- Besides the reference, it carries a short **Recovery** section (≤10 lines): the service
-  states (§5.4), then the exact `mesh exec` lines for start/restart (durable automatically),
-  a hung service (`opencode service stop` with `--timeout`, else kill the `service.json`
-  pid), the log (`~/.local/share/opencode/log/opencode.log`) and `opencode upgrade
-  [<version>]` (rollback); run from another device, since `mesh` doesn't need opencode.
+- Describes the interface plainly and shows examples; no prescriptive rules. Under ~60 lines:
+  the opening (any device, remote opencode always works, the `opencode` skill for opencode
+  usage); a reference (`status`, `exec` argv / `-c` / `-s` and flags, `cp`, targets, exit codes
+  incl. 124 and 255); examples per OS family, CLI and MCP; recipes (recovery: service states,
+  start/stop/kill, log, `opencode upgrade`; setting up a machine outside the mesh through a
+  device that reaches it, `argv: ["ssh", …, "bash", "-s"]` + `stdin`; handing a task to another
+  device's `opencode run`); notes (offline devices, `MESH_FROM`, the CLI path).
 - Lives in the mesh repo at `skills/mesh/SKILL.md` and reaches devices through normal sync.
 - Written to the repo only by `mesh up` (when creating a mesh) and `mesh update`.
 - When writing, the binary adds frontmatter `metadata.mesh/version` (its version) and
@@ -828,7 +874,7 @@ Text rendering for the model:
   `mesh-macos-x64`, `mesh-macos-arm64`, `mesh-windows-x64.exe`, `meshw-windows-x64.exe`,
   `mesh-windows-arm64.exe`, `meshw-windows-arm64.exe`, `SHA256SUMS`.
 - Release profile: `opt-level = "z"`, `lto = true`, `codegen-units = 1`, `panic = "abort"`,
-  `strip = true`. Targets: < ~1 MB binary, ~1–2 MB idle RSS for `mesh mcp`.
+  `strip = true`. Targets: < ~1 MB binary, ~1–2 MB idle RSS for the daemon.
 - CI (`release.yml`): on a `v*` tag, fail unless it matches the `Cargo.toml` version, build
   all targets (Linux musl via cargo-zigbuild, both macOS on one runner, both Windows MSVC),
   write `SHA256SUMS`, publish the release (prerelease when the tag has a `-`; if a release for
@@ -841,8 +887,8 @@ Text rendering for the model:
   `gh api repos/Hona/mesh/contents/install.ps1 -H "Accept: application/vnd.github.raw" | Out-String | iex`
 - Both download via `gh release download` (latest, or `MESH_VERSION=<x.y.z>`), check
   `SHA256SUMS`, then run `mesh up` from the download folder; `up` installs to the paths in §4.4
-  (rename-aside if in use), puts it on PATH (user PATH / shell profile line), restarts the MCP
-  server, and restarts the opencode service when safe (§5.3 step 12). Arguments for `up`:
+  (rename-aside if in use), puts it on PATH (user PATH / shell profile line), starts the daemon,
+  registers MCP, and restarts the opencode service when safe (§5.3 step 12). Arguments for `up`:
   `| sh -s -- <args>` / `$env:MESH_UP_ARGS`.
 - Copy-paste prompt (any OS):
   > Install opencode mesh on this device: use `gh release download` to get the `mesh` binary
@@ -861,8 +907,12 @@ Text rendering for the model:
 
 ## 12. Open items (verify manually during phases)
 
-- Does an opencode service started over an SSH session survive disconnect (Windows sshd job
-  object)? Usually moot (desktop/login keeps it running). If it dies, add a login autostart.
+- Closed by the daemon (§6.6): an opencode service (or anything) started by `mesh exec`
+  survives the SSH session; `gh` and other credential-store logins work in remote commands.
+- Commands now run with the user's normal (on Windows admins: filtered, non-elevated) token,
+  as the user's own programs do; before, an admin's SSH session ran them elevated.
+- macOS: the daemon LaunchAgent and the `launchctl` takeover are untested (air offline); no
+  stall detection there.
 - Can `opencode api --data` / `opencode session import` read stdin? If not, large payloads go
   via `mesh cp` + a path.
 - Windows admin keys file + elevated `keys` task end to end: verified on adais (one UAC; the
@@ -875,7 +925,6 @@ Text rendering for the model:
   the task run a copy in `%ProgramFiles%\opencode-mesh\` that only elevated steps refresh, at the
   cost of one UAC per `mesh update` on admin devices.
 - macOS Remote Login + full-disk-access flow (needs air online).
-- Debian VPS is not on Tailscale yet; it needs Tailscale to join.
 
 ## 13. Out of scope for v1
 

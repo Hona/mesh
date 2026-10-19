@@ -12,6 +12,9 @@ pub(crate) struct State {
     pub shell: Option<Shell>,
     #[serde(default)]
     pub synced: Option<String>,
+    /// The daemon's MCP endpoint, `http://127.0.0.1:<port>/mcp`, chosen by `mesh up`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mcp_port: Option<u16>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -77,16 +80,16 @@ pub(crate) struct Envelope {
     #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub env: std::collections::BTreeMap<String, String>,
     pub tty: bool,
-    /// The client streams stdin; false: the command's stdin is the null device (absent = true,
-    /// as older clients always streamed).
-    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    /// The client streams stdin; false: the command's stdin is the null device.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub stdin: bool,
     /// End the command early when it stalls (SPEC §5.5).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub stall: bool,
-    /// Run outside the SSH session so what it starts outlives it (SPEC §5.5).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
-    pub durable: bool,
+    /// Relay → daemon only: the SSH session's environment, the command's base environment
+    /// (SPEC §6.6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relay_env: Option<std::collections::BTreeMap<String, String>>,
     /// Seconds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<f64>,
@@ -95,20 +98,15 @@ pub(crate) struct Envelope {
     pub device: Option<String>,
 }
 
-fn yes() -> bool {
-    true
-}
-
-fn is_true(b: &bool) -> bool {
-    *b
-}
-
 /// How a remote command ended (the `exit` frame).
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub(crate) struct ExitInfo {
     pub code: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Where it ran: "daemon" (the user's session) or "ssh" (inside the SSH session).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 /// One device's result in `mesh exec --json` / MCP `exec` (SPEC §5.5).
@@ -129,6 +127,8 @@ pub(crate) struct ExecResult {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -183,16 +183,12 @@ impl ServiceState {
         }
     }
 
-    /// From a device's status JSON: a state, or the bool older versions sent.
+    /// From a device's status JSON.
     pub fn from_json(v: Option<&serde_json::Value>) -> Self {
-        match v {
-            Some(serde_json::Value::Bool(true)) => Self::Ok,
-            Some(serde_json::Value::String(s)) => match s.as_str() {
-                "ok" => Self::Ok,
-                "hung" => Self::Hung,
-                "stale" => Self::Stale,
-                _ => Self::Down,
-            },
+        match v.and_then(|v| v.as_str()) {
+            Some("ok") => Self::Ok,
+            Some("hung") => Self::Hung,
+            Some("stale") => Self::Stale,
             _ => Self::Down,
         }
     }
@@ -222,6 +218,9 @@ pub(crate) struct DeviceStatus {
     pub reachable: Option<bool>,
     pub latency_ms: Option<u64>,
     pub opencode: Option<Opencode>,
+    /// "up" | "down": is the device's daemon answering (SPEC §6.6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<String>,
     pub mesh: Option<String>,
 }
 

@@ -6,11 +6,12 @@ use crate::host::process;
 use crate::host::{opencode, paths};
 use crate::model::{Envelope, ExitInfo, Shell};
 use crate::transport::frame::{self, CANCEL, EXIT, HELLO, PING, START, STDERR, STDIN, STDOUT};
-use std::collections::HashMap;
+use crate::transport::mux;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
@@ -43,13 +44,17 @@ fn parse(bytes: &[u8]) -> Result<Envelope, String> {
     Ok(env)
 }
 
-fn resolve(prog: &str) -> Result<PathBuf, String> {
+/// `path`: the PATH the command gets (the relayed session's), when not this process's.
+fn resolve(prog: &str, path: Option<&String>) -> Result<PathBuf, String> {
     match prog {
         "opencode" => opencode::bin().ok_or_else(|| "opencode not found on this device".into()),
-        "mesh" => std::env::current_exe().map_err(|e| e.to_string()),
+        // the console build next to this one (the daemon is meshw on Windows)
+        "mesh" => std::env::current_exe()
+            .map(|p| p.with_file_name(crate::host::install::names()[0]))
+            .map_err(|e| e.to_string()),
         // Windows: find .cmd/.bat as well as .exe on PATH, like a shell would
         p if cfg!(windows) && !p.contains(['/', '\\']) && Path::new(p).extension().is_none() => {
-            Ok(paths::on_path(p).unwrap_or_else(|| p.into()))
+            Ok(paths::on_path_in(p, path.map(Into::into)).unwrap_or_else(|| p.into()))
         }
         p => Ok(p.into()),
     }
@@ -166,7 +171,12 @@ pub(crate) fn build(env: &Envelope) -> Result<Built, String> {
     let mut b = match (&env.argv, &env.command, &env.script) {
         (Some(argv), _, _) => {
             let (prog, args) = argv.split_first().ok_or("empty argv")?;
-            let mut c = process::command(resolve(prog)?);
+            let path = env.relay_env.as_ref().and_then(|e| {
+                e.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("PATH"))
+                    .map(|(_, v)| v)
+            });
+            let mut c = process::command(resolve(prog, path)?);
             c.args(args);
             Built {
                 cmd: c,
@@ -183,6 +193,9 @@ pub(crate) fn build(env: &Envelope) -> Result<Built, String> {
         (None, None, None) => return Err("envelope has no argv, command or script".into()),
     };
     let c = &mut b.cmd;
+    if let Some(base) = &env.relay_env {
+        c.env_clear().envs(base);
+    }
     if !env.tty {
         // plain text for programs (and PowerShell 7.2+, whose errors are coloured otherwise)
         c.env("NO_COLOR", "1").env("TERM", "dumb");
@@ -195,11 +208,6 @@ pub(crate) fn build(env: &Envelope) -> Result<Built, String> {
         c.current_dir(dir);
     }
     c.envs(&env.env).env("MESH_FROM", &env.from);
-    #[cfg(target_os = "linux")]
-    if super::durable::wanted(env) {
-        let c = std::mem::replace(&mut b.cmd, Command::new(""));
-        b.cmd = super::durable::scope(c);
-    }
     Ok(b)
 }
 
@@ -315,22 +323,13 @@ pub(crate) fn envelope(arg: Option<&str>) -> i32 {
             .map_err(|e| e.to_string())
             .and_then(|b| parse(&b)),
     };
-    #[cfg(windows)]
+    // A relay (SPEC §6.6): the daemon runs it in the user's session, unless it needs this
+    // session's terminal or the daemon can't be reached.
     if let Ok(e) = &env
-        && super::durable::wanted(e)
-        && super::durable::in_ssh()
+        && !e.tty
+        && let Some(d) = super::daemon::connect(true)
     {
-        let info = super::durable::run(&super::durable::new_id(), e, &|b| {
-            let mut o = io::stdout();
-            let _ = o.write_all(b);
-            let _ = o.flush();
-        });
-        match info.error.as_deref() {
-            Some(STALLED) => eprintln!("mesh: {STALLED}: {STALL_HINT}"),
-            Some(err) => eprintln!("mesh: {err}"),
-            None => {}
-        }
-        return info.code.unwrap_or(255);
+        return oneshot_via(d, e.clone());
     }
     let spawned = env.and_then(|e| {
         let mut b = build(&e)?;
@@ -391,6 +390,58 @@ pub(crate) fn envelope(arg: Option<&str>) -> i32 {
     }
 }
 
+/// One-shot through the daemon: stdin, stdout, stderr and the exit code relayed.
+fn oneshot_via(d: mux::Client, mut env: Envelope) -> i32 {
+    env.relay_env = Some(relay_env());
+    env.device = None;
+    let stream_in = env.stdin;
+    let d = Arc::new(d);
+    if d.send(START, 1, &serde_json::to_vec(&env).unwrap_or_default())
+        .is_err()
+    {
+        eprintln!("mesh: the daemon went away");
+        return 255;
+    }
+    if stream_in {
+        let d = d.clone();
+        std::thread::spawn(move || {
+            let mut stdin = io::stdin().lock();
+            let mut buf = vec![0u8; frame::CHUNK];
+            while let Ok(n @ 1..) = stdin.read(&mut buf) {
+                if d.send(STDIN, 1, &buf[..n]).is_err() {
+                    return;
+                }
+            }
+            let _ = d.send(STDIN, 1, &[]);
+        });
+    }
+    let mut next = d.frames();
+    while let Some(f) = next() {
+        match f.kind {
+            STDOUT => {
+                let mut o = io::stdout().lock();
+                let _ = o.write_all(&f.data);
+                let _ = o.flush();
+            }
+            STDERR => {
+                let _ = io::stderr().write_all(&f.data);
+            }
+            EXIT => {
+                let info: ExitInfo = serde_json::from_slice(&f.data).unwrap_or_default();
+                match info.error.as_deref() {
+                    Some(STALLED) => eprintln!("mesh: {STALLED}: {STALL_HINT}"),
+                    Some(e) => eprintln!("mesh: {e}"),
+                    None => {}
+                }
+                return info.code.unwrap_or(255);
+            }
+            _ => {}
+        }
+    }
+    eprintln!("mesh: the daemon went away");
+    255
+}
+
 pub(crate) const STALL_HINT: &str = "no output and idle for 20 s; is it waiting for input?";
 
 fn stall_kill(k: &process::Killer, ended: &AtomicU8) {
@@ -415,23 +466,24 @@ fn timer(t: f64, k: Arc<process::Killer>, ended: Arc<AtomicU8>, done: mpsc::Rece
     });
 }
 
-type Out = Arc<Mutex<io::Stdout>>;
+use crate::transport::frame::Out;
 
-fn send(out: &Out, kind: u8, id: u32, data: &[u8]) {
+pub(crate) fn send(out: &Out, kind: u8, id: u32, data: &[u8]) {
     let _ = frame::write(&mut *lock(out), kind, id, data);
 }
 
-fn exit_frame(code: i32, error: Option<String>) -> Vec<u8> {
+pub(crate) fn exit_frame(code: i32, error: Option<String>, via: &str) -> Vec<u8> {
     serde_json::to_vec(&ExitInfo {
         code: Some(code),
         error,
+        via: Some(via.into()),
     })
     .unwrap_or_default()
 }
 
 struct Running {
     stdin: Option<mpsc::Sender<Vec<u8>>>,
-    /// Cancel / lost link: kill the tree (or ask the run task to, for a durable command).
+    /// Cancel / lost link: kill the tree.
     stop: Arc<dyn Fn() + Send + Sync>,
     /// Stall detection, when asked for.
     watch: Option<(Watch, Arc<process::Killer>, Arc<AtomicU8>)>,
@@ -439,12 +491,74 @@ struct Running {
 
 type Table = Arc<Mutex<HashMap<u32, Running>>>;
 
-/// One timer for every command on the link: stall checks while no stdin is still streaming in
-/// (a command waiting for its caller's input isn't stalled).
-fn watch_stalls(table: Table) {
+/// Commands running in this process, on every link (the daemon drains to zero to quit).
+static RUNNING: AtomicU32 = AtomicU32::new(0);
+/// Daemon: asked to quit; exit once nothing runs.
+pub(crate) static DRAINING: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn exit_if_drained() {
+    if DRAINING.load(Ordering::Relaxed) && RUNNING.load(Ordering::Relaxed) == 0 {
+        eprintln!("drained, exiting");
+        std::process::exit(0);
+    }
+}
+
+/// The commands of one link (an SSH channel, or one relay's connection to the daemon), run by
+/// this process. `via` goes into their exit frames.
+pub(crate) struct Link {
+    out: Out,
+    table: Table,
+    via: &'static str,
+}
+
+impl Link {
+    pub(crate) fn new(out: Out, via: &'static str) -> Link {
+        let table: Table = Arc::new(Mutex::new(HashMap::new()));
+        watch_stalls(Arc::downgrade(&table));
+        Link { out, table, via }
+    }
+
+    /// START, STDIN, CANCEL for this link's commands.
+    pub(crate) fn handle(&self, f: frame::Frame) {
+        match f.kind {
+            START => {
+                if let Err((code, e)) = start(f.id, &f.data, &self.out, &self.table, self.via) {
+                    send(&self.out, EXIT, f.id, &exit_frame(code, Some(e), self.via));
+                }
+            }
+            STDIN => {
+                if let Some(r) = lock(&self.table).get_mut(&f.id) {
+                    if f.data.is_empty() {
+                        r.stdin = None; // EOF
+                    } else if let Some(tx) = &r.stdin {
+                        let _ = tx.send(f.data);
+                    }
+                }
+            }
+            CANCEL => {
+                if let Some(r) = lock(&self.table).get(&f.id) {
+                    (r.stop)();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The link is gone: nothing it started keeps running without it.
+    pub(crate) fn stop_all(&self) {
+        for r in lock(&self.table).values() {
+            (r.stop)();
+        }
+    }
+}
+
+/// One timer per link: stall checks while no stdin is still streaming in (a command waiting
+/// for its caller's input isn't stalled). Ends with the link.
+fn watch_stalls(table: std::sync::Weak<Mutex<HashMap<u32, Running>>>) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(TICK);
+            let Some(table) = table.upgrade() else { return };
             for r in lock(&table).values_mut() {
                 if let (None, Some((w, k, ended))) = (&r.stdin, &mut r.watch)
                     && w.stalled(k)
@@ -456,84 +570,138 @@ fn watch_stalls(table: Table) {
     });
 }
 
-/// Persistent link: many concurrent commands, framed on stdin/stdout.
+/// The SSH session's environment, minus what only describes that session: the daemon starts
+/// relayed commands with it, as they'd have had in the session (fresh PATH and all).
+pub(crate) fn relay_env() -> std::collections::BTreeMap<String, String> {
+    std::env::vars()
+        .filter(|(k, _)| {
+            let k = k.to_ascii_uppercase();
+            !k.starts_with("SSH_") && !k.starts_with("XDG_SESSION_")
+        })
+        .collect()
+}
+
+/// The relay's connection to the daemon: commands started there, by id.
+struct Relayed {
+    daemon: mux::Client,
+    ids: Mutex<HashSet<u32>>,
+    alive: AtomicBool,
+}
+
+impl Relayed {
+    /// Pump the daemon's frames to `out` until it goes away; then fail what was still running.
+    fn start(daemon: mux::Client, out: Out) -> Arc<Relayed> {
+        let r = Arc::new(Relayed {
+            daemon,
+            ids: Mutex::new(HashSet::new()),
+            alive: AtomicBool::new(true),
+        });
+        let (me, mut next) = (r.clone(), r.daemon.frames());
+        std::thread::spawn(move || {
+            while let Some(f) = next() {
+                if f.kind == EXIT {
+                    lock(&me.ids).remove(&f.id);
+                }
+                if matches!(f.kind, STDOUT | STDERR | EXIT) {
+                    send(&out, f.kind, f.id, &f.data);
+                }
+            }
+            me.alive.store(false, Ordering::Relaxed);
+            for id in lock(&me.ids).drain() {
+                let e = Some("the daemon went away".into());
+                send(&out, EXIT, id, &exit_frame(255, e, "daemon"));
+            }
+        });
+        r
+    }
+
+    /// Hand a START to the daemon with the session's environment; false if it can't take it.
+    fn start_command(
+        &self,
+        id: u32,
+        data: &[u8],
+        renv: &std::collections::BTreeMap<String, String>,
+    ) -> bool {
+        let Ok(mut env) = parse(data) else {
+            return false;
+        };
+        if env.tty {
+            return false;
+        }
+        env.relay_env = Some(renv.clone());
+        env.device = None; // run there, not routed on through its mux
+        let data = serde_json::to_vec(&env).unwrap_or_default();
+        lock(&self.ids).insert(id);
+        if self.daemon.send(START, id, &data).is_err() {
+            lock(&self.ids).remove(&id);
+            return false;
+        }
+        true
+    }
+}
+
+/// Persistent link (SPEC §6.5): many concurrent commands, framed on stdin/stdout. A relay
+/// (§6.6): each command goes to this user's daemon, or runs here in the SSH session when the
+/// daemon can't be reached.
 pub(crate) fn serve() -> i32 {
     process::set_background();
-    let out: Out = Arc::new(Mutex::new(io::stdout()));
+    let out: Out = Arc::new(Mutex::new(Box::new(io::stdout())));
     send(
         &out,
         HELLO,
         0,
         format!(r#"{{"v":1,"mesh":"{VERSION}"}}"#).as_bytes(),
     );
-    let table: Table = Arc::new(Mutex::new(HashMap::new()));
-    watch_stalls(table.clone());
+    let local = Link::new(out.clone(), "ssh");
+    let renv = relay_env();
+    // when starting the daemon last failed (logged out, disabled): retried after a minute
+    let (mut daemon, mut failed) = (None::<Arc<Relayed>>, None::<Instant>);
     let mut input = io::BufReader::with_capacity(frame::CHUNK, io::stdin().lock());
     while let Ok(Some(f)) = frame::read(&mut input) {
         match f.kind {
             START => {
-                if let Err((code, e)) = start(f.id, &f.data, &out, &table) {
-                    send(&out, EXIT, f.id, &exit_frame(code, Some(e)));
-                }
-            }
-            STDIN => {
-                if let Some(r) = lock(&table).get_mut(&f.id) {
-                    if f.data.is_empty() {
-                        r.stdin = None; // EOF
-                    } else if let Some(tx) = &r.stdin {
-                        let _ = tx.send(f.data);
+                if daemon
+                    .as_ref()
+                    .is_none_or(|d| !d.alive.load(Ordering::Relaxed))
+                {
+                    // down: start it (registering its autostart if needed)
+                    let start = failed.is_none_or(|t| t.elapsed() > Duration::from_secs(60));
+                    daemon = super::daemon::connect(start).map(|c| Relayed::start(c, out.clone()));
+                    if start && daemon.is_none() {
+                        failed = Some(Instant::now());
                     }
                 }
-            }
-            CANCEL => {
-                if let Some(r) = lock(&table).get(&f.id) {
-                    (r.stop)();
+                let sent = daemon
+                    .as_ref()
+                    .is_some_and(|d| d.start_command(f.id, &f.data, &renv));
+                if !sent {
+                    local.handle(f);
                 }
             }
+            STDIN | CANCEL => match daemon.as_ref().filter(|d| lock(&d.ids).contains(&f.id)) {
+                Some(d) => {
+                    let _ = d.daemon.send(f.kind, f.id, &f.data);
+                }
+                None => local.handle(f),
+            },
             PING => send(&out, PING, f.id, &[]),
             _ => {}
         }
     }
-    // The link is gone: nothing keeps running without it.
-    for r in lock(&table).values() {
-        (r.stop)();
-    }
+    // The link is gone: nothing keeps running without it (closing the daemon connection makes
+    // the daemon stop that connection's commands).
+    local.stop_all();
     0
 }
 
-/// A durable command (Windows, in an SSH session): run by the user-context run task.
-#[cfg(windows)]
-fn start_durable(id: u32, env: Envelope, out: &Out, table: &Table) {
-    let job = super::durable::new_id();
-    let j = job.clone();
-    lock(table).insert(
-        id,
-        Running {
-            stdin: None,
-            stop: Arc::new(move || super::durable::cancel(&j)),
-            watch: None, // the run task watches it
-        },
-    );
-    let (out, table) = (out.clone(), table.clone());
-    std::thread::spawn(move || {
-        let info = super::durable::run(&job, &env, &|b| send(&out, STDOUT, id, b));
-        lock(&table).remove(&id);
-        send(
-            &out,
-            EXIT,
-            id,
-            &serde_json::to_vec(&info).unwrap_or_default(),
-        );
-    });
-}
-
-fn start(id: u32, data: &[u8], out: &Out, table: &Table) -> Result<(), (i32, String)> {
+fn start(
+    id: u32,
+    data: &[u8],
+    out: &Out,
+    table: &Table,
+    via: &'static str,
+) -> Result<(), (i32, String)> {
     let env = parse(data).map_err(|e| (255, e))?;
-    #[cfg(windows)]
-    if super::durable::wanted(&env) && super::durable::in_ssh() {
-        start_durable(id, env, out, table);
-        return Ok(());
-    }
     let Built {
         mut cmd,
         input: feed,
@@ -579,6 +747,7 @@ fn start(id: u32, data: &[u8], out: &Out, table: &Table) -> Result<(), (i32, Str
     }
     let ended = Arc::new(AtomicU8::new(RAN));
     let k = killer.clone();
+    RUNNING.fetch_add(1, Ordering::Relaxed);
     lock(table).insert(
         id,
         Running {
@@ -610,11 +779,14 @@ fn start(id: u32, data: &[u8], out: &Out, table: &Table) -> Result<(), (i32, Str
             TIMEOUT => exit_frame(
                 TIMED_OUT,
                 Some(format!("timeout after {}s", timeout.unwrap_or_default())),
+                via,
             ),
-            STALL_KILL => exit_frame(TIMED_OUT, Some(STALLED.into())),
-            _ => exit_frame(code(st), None),
+            STALL_KILL => exit_frame(TIMED_OUT, Some(STALLED.into()), via),
+            _ => exit_frame(code(st), None, via),
         };
         send(&out, EXIT, id, &exit);
+        RUNNING.fetch_sub(1, Ordering::Relaxed);
+        exit_if_drained();
     });
     Ok(())
 }

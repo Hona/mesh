@@ -1,8 +1,9 @@
-//! Per-user, per-build local socket between mesh processes and the mux (SPEC §6.5):
-//! a named pipe on Windows (current user only, no remote clients), a unix socket elsewhere.
+//! Per-user, per-build local sockets between mesh processes and the mux (SPEC §6.5) or the
+//! daemon (tag `daemon-<build>`, §6.6): a named pipe on Windows (current user only, no remote
+//! clients), a unix socket in the 0700 state dir elsewhere.
 //! `&Conn` implements Read + Write and can be used from several threads at once.
 
-pub(crate) use imp::{Conn, Listener, bind, connect, endpoints};
+pub(crate) use imp::{Conn, bind, connect, endpoints};
 
 #[cfg(windows)]
 mod imp {
@@ -326,6 +327,8 @@ mod imp {
     fn path(tag: &str) -> PathBuf {
         let name = if tag.is_empty() {
             "mux.sock".to_string()
+        } else if tag.starts_with("daemon-") {
+            format!("{tag}.sock")
         } else {
             format!("mux-{tag}.sock")
         };
@@ -344,6 +347,8 @@ mod imp {
                 let stem = n.strip_suffix(".sock")?;
                 if stem == "mux" {
                     Some(String::new())
+                } else if stem.starts_with("daemon-") {
+                    Some(stem.to_string())
                 } else {
                     stem.strip_prefix("mux-").map(String::from)
                 }

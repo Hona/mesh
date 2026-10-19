@@ -1,5 +1,7 @@
-//! `mesh mcp` (SPEC §8): stdio MCP server, newline-delimited JSON-RPC 2.0, hand-rolled.
-//! Idle it is one thread blocked on stdin; each tool call runs on its own thread.
+//! MCP server (SPEC §8), hand-rolled JSON-RPC 2.0: served by the daemon over Streamable HTTP
+//! (`http`), and as `mesh mcp` on stdio (hidden; fallback and debugging).
+
+pub(crate) mod http;
 
 use crate::app::exec::{self, Input};
 use crate::app::{self, Fail, VERSION, status};
@@ -9,44 +11,45 @@ use serde_json::{Value, json};
 use std::io::{BufRead, Write};
 use std::sync::{Arc, Mutex};
 
-type Out = Arc<Mutex<std::io::Stdout>>;
-
+/// `mesh mcp`: newline-delimited JSON-RPC on stdio; each request on its own thread.
 pub(crate) fn run() -> i32 {
     app::background("mcp", "mcp");
-    let out: Out = Arc::new(Mutex::new(std::io::stdout()));
+    let out = Arc::new(Mutex::new(std::io::stdout()));
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
         let Ok(req) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let Some(id) = req.get("id").cloned() else {
-            continue;
-        }; // notifications need no answer
-        let params = req["params"].clone();
-        match req["method"].as_str().unwrap_or("") {
-            "initialize" => reply(&out, id, Ok(initialize(&params))),
-            "ping" => reply(&out, id, Ok(json!({}))),
-            "tools/list" => reply(&out, id, Ok(json!({ "tools": tools() }))),
-            "tools/call" => {
-                let out = out.clone();
-                std::thread::spawn(move || reply(&out, id, Ok(call(&params))));
+        let out = out.clone();
+        std::thread::spawn(move || {
+            if let Some(msg) = handle(&req) {
+                let mut o = out.lock().unwrap_or_else(|e| e.into_inner());
+                let _ = writeln!(o, "{msg}");
+                let _ = o.flush();
             }
-            m => reply(&out, id, Err((-32601, format!("method not found: {m}")))),
-        }
+        });
     }
     0
 }
 
-fn reply(out: &Out, id: Value, r: Result<Value, (i64, String)>) {
-    let msg = match r {
+/// One JSON-RPC message: the response, or None for a notification (or a response).
+pub(crate) fn handle(req: &Value) -> Option<Value> {
+    let id = req.get("id").cloned()?;
+    req.get("method")?;
+    let params = &req["params"];
+    let r = match req["method"].as_str().unwrap_or("") {
+        "initialize" => Ok(initialize(params)),
+        "ping" => Ok(json!({})),
+        "tools/list" => Ok(json!({ "tools": tools() })),
+        "tools/call" => Ok(call(params)),
+        m => Err((-32601, format!("method not found: {m}"))),
+    };
+    Some(match r {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err((code, message)) => {
             json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })
         }
-    };
-    let mut o = out.lock().unwrap_or_else(|e| e.into_inner());
-    let _ = writeln!(o, "{msg}");
-    let _ = o.flush();
+    })
 }
 
 fn initialize(params: &Value) -> Value {
@@ -55,9 +58,13 @@ fn initialize(params: &Value) -> Value {
         .map(|d| format!("{} ({})", d.name, d.os))
         .collect();
     // The absolute CLI path: right after a first install, opencode's shells don't have the new
-    // PATH yet, but this server was just (re)started by `mesh up`.
+    // PATH yet. The console build: the daemon itself is the windowless one on Windows.
     let cli = std::env::current_exe()
-        .map(|p| p.display().to_string())
+        .map(|p| {
+            p.with_file_name(crate::host::install::names()[0])
+                .display()
+                .to_string()
+        })
         .unwrap_or_else(|_| "mesh".into());
     json!({
         "protocolVersion": params["protocolVersion"].as_str().unwrap_or("2025-06-18"),
@@ -85,22 +92,20 @@ fn tools() -> Value {
         },
         {
             "name": "exec",
-            "description": "Run a command on mesh devices. Give one of: argv runs the exact program with no shell; command runs a one-line string in the device's own shell; script runs a multi-line script in the device's own shell, no quoting needed. argv[0] \"opencode\" or \"mesh\" resolves to that device's install.",
+            "description": "Run on mesh devices, in the user's own session there: give argv or script. What it starts keeps running after it returns.",
             "inputSchema": {
                 "type": "object",
                 "required": ["target"],
                 "properties": {
                     "target": { "type": "string", "description": "name, a,b, all, self, os:linux|macos|windows" },
-                    "argv": { "type": "array", "items": { "type": "string" } },
-                    "command": { "type": "string" },
-                    "script": { "type": "string", "description": "multi-line script for the device's shell (see status: pwsh, bash, …)" },
-                    "stdin": { "type": "string", "description": "without it, the command's stdin is empty" },
+                    "argv": { "type": "array", "items": { "type": "string" }, "description": "one program and its arguments, passed exactly as given (no shell, no quoting); fastest. argv[0] \"opencode\" or \"mesh\" is that device's install" },
+                    "script": { "type": "string", "description": "code for the device's own shell (status shows which: pwsh, bash, …): pipes, variables, several lines, any length; no escaping needed" },
+                    "stdin": { "type": "string", "description": "fed to the command; without it, stdin is empty" },
                     "stall": { "type": "boolean", "default": true, "description": "end the command when it has no output and an idle process tree for 20 s; false for commands that wait quietly" },
                     "cwd": { "type": "string" },
                     "env": { "type": "object", "additionalProperties": { "type": "string" } },
                     "timeout": { "type": "number", "default": 120, "description": "seconds; kills the whole process tree" },
-                    "max_bytes": { "type": "number", "default": 50000, "description": "per stream; keeps head + tail" },
-                    "durable": { "type": "boolean", "default": false, "description": "run outside the SSH session so what it starts keeps running (servers, Start-Process); automatic for opencode service start|restart" }
+                    "max_bytes": { "type": "number", "default": 50000, "description": "per stream; keeps head + tail" }
                 }
             }
         }
@@ -111,7 +116,7 @@ fn call(p: &Value) -> Value {
     let args = &p["arguments"];
     let r = match p["name"].as_str() {
         Some("status") => status_tool(args),
-        Some("exec") => exec_tool(args),
+        Some("exec") => exec_tool(args, p["_meta"]["ai.opencode/sessionID"].as_str()),
         other => Err(format!("unknown tool {other:?}")),
     };
     match r {
@@ -132,18 +137,17 @@ fn status_tool(a: &Value) -> Result<(String, Value), String> {
     ))
 }
 
-fn exec_tool(a: &Value) -> Result<(String, Value), String> {
+/// `session`: the calling opencode session, passed on as `MESH_SESSION` (SPEC §8.2).
+fn exec_tool(a: &Value, session: Option<&str>) -> Result<(String, Value), String> {
     let target = a["target"].as_str().ok_or("target is required")?;
     let argv: Option<Vec<String>> = a["argv"].as_array().map(|v| {
         v.iter()
             .filter_map(|x| x.as_str().map(String::from))
             .collect()
     });
-    let command = a["command"].as_str().map(String::from);
     let script = a["script"].as_str().map(String::from);
-    let given = [argv.is_some(), command.is_some(), script.is_some()];
-    if given.iter().filter(|g| **g).count() != 1 || argv.as_ref().is_some_and(Vec::is_empty) {
-        return Err("give exactly one of argv (non-empty), command or script".into());
+    if argv.is_some() == script.is_some() || argv.as_ref().is_some_and(Vec::is_empty) {
+        return Err("give exactly one of argv (non-empty) or script".into());
     }
     if script.is_some() && a["stdin"].is_string() {
         return Err(
@@ -151,9 +155,8 @@ fn exec_tool(a: &Value) -> Result<(String, Value), String> {
                 .into(),
         );
     }
-    let env = Envelope {
+    let mut env = Envelope {
         argv,
-        command,
         script,
         stall: a["stall"].as_bool().unwrap_or(true),
         cwd: a["cwd"].as_str().map(String::from),
@@ -166,9 +169,13 @@ fn exec_tool(a: &Value) -> Result<(String, Value), String> {
             })
             .unwrap_or_default(),
         timeout: Some(a["timeout"].as_f64().unwrap_or(120.0)),
-        durable: a["durable"].as_bool().unwrap_or(false),
         ..Default::default()
     };
+    if let Some(s) = session {
+        env.env
+            .entry("MESH_SESSION".into())
+            .or_insert_with(|| s.into());
+    }
     let input = a["stdin"]
         .as_str()
         .map_or(Input::Empty, |s| Input::Bytes(s.as_bytes().to_vec()));

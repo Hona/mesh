@@ -1,9 +1,8 @@
 //! Commands: orchestration only.
 
 pub(crate) mod cp;
-pub(crate) mod durable;
+pub(crate) mod daemon;
 pub(crate) mod exec;
-pub(crate) mod mux;
 pub(crate) mod rm;
 pub(crate) mod serve;
 mod skill;

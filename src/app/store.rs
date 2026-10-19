@@ -137,50 +137,6 @@ pub(crate) fn all_devices() -> Vec<Device> {
     devices(&read_index(), &mut Vec::new())
 }
 
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
-
-fn result_file() -> PathBuf {
-    paths::state_dir().join("sync.result")
-}
-
-/// Record how this sync ended, for a remote caller waiting on this device's own sync job.
-pub(crate) fn write_sync_result(r: &Result<crate::model::SyncReport, Fail>) {
-    let v = match r {
-        Ok(report) => serde_json::json!({ "at_ms": now_ms(), "report": report }),
-        Err(Fail(code, msg)) => {
-            serde_json::json!({ "at_ms": now_ms(), "code": code, "error": msg })
-        }
-    };
-    let _ = write_file(&result_file(), v.to_string().as_bytes());
-}
-
-/// The last recorded sync: (when, how it ended).
-pub(crate) fn read_sync_result() -> Option<(u64, Result<crate::model::SyncReport, Fail>)> {
-    let v: serde_json::Value = serde_json::from_slice(&fs::read(result_file()).ok()?).ok()?;
-    let at = v["at_ms"].as_u64()?;
-    let r = match v.get("report") {
-        Some(rep) => Ok(serde_json::from_value(rep.clone()).ok()?),
-        None => Err(Fail(
-            v["code"].as_i64().unwrap_or(1) as i32,
-            v["error"].as_str().unwrap_or("").into(),
-        )),
-    };
-    Some((at, r))
-}
-
-/// A sync holds the lock right now (its process is alive).
-pub(crate) fn sync_running() -> bool {
-    let p = paths::state_dir().join("sync.lock");
-    let pid = fs::read_to_string(p)
-        .ok()
-        .and_then(|s| s.trim().parse::<u32>().ok());
-    pid.and_then(crate::host::process::pid_exe).is_some()
-}
-
 /// Held while a sync runs; scheduled and manual syncs never overlap.
 pub(crate) struct Lock(PathBuf);
 

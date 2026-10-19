@@ -106,13 +106,12 @@ pub(crate) fn leave(
     );
 
     // 2. opencode: MCP registration and the mesh-owned skills folder
-    let mesh = install::dir()
-        .join(install::names()[0])
-        .display()
-        .to_string();
+    let port = state.mcp_port.unwrap_or(0);
+    let ours =
+        |e: &serde_json::Value| e["url"].as_str() == Some(&format!("http://127.0.0.1:{port}/mcp"));
     report(
         "mcp",
-        opencode::mcp_unregister("mesh", &[mesh, "mcp".into()]),
+        opencode::mcp_unregister("mesh", &ours),
         "\"mesh\" unregistered",
         "not registered",
     );
@@ -131,12 +130,12 @@ pub(crate) fn leave(
         "no mesh skills here",
     );
 
-    // 3. scheduled sync, keys block (+ the elevated keys task: one UAC on admin Windows)
+    // 3. the daemon's autostart, keys block (+ the elevated keys task: one UAC on admin Windows)
     report(
-        "schedule",
-        schedule::remove_sync(),
-        "sync job removed",
-        "no sync job",
+        "daemon",
+        schedule::remove_daemon(),
+        "autostart removed",
+        "no autostart",
     );
     #[cfg(windows)]
     if ssh::keys_need_admin() {
@@ -186,9 +185,9 @@ pub(crate) fn leave(
         "no mesh PATH line in shell profiles",
     );
 
-    // 4. last: this build's mux, then the state dir (key, cache, logs)
-    exec::stop_mux();
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // 4. last: the daemon (it logs into the state dir), then the state dir (key, cache, logs)
+    super::daemon::quit_all(None);
+    std::thread::sleep(std::time::Duration::from_millis(500));
     let dir = paths::state_dir();
     let r = std::fs::remove_dir_all(&dir).map(|_| true).map_err(|e| {
         format!(

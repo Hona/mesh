@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 pub(crate) struct Installed {
     pub mesh: PathBuf,
     /// Windows only: the windowless build used by scheduled tasks.
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub meshw: Option<PathBuf>,
     pub changed: bool,
 }

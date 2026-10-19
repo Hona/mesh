@@ -48,12 +48,18 @@ pub(crate) fn app_data_dir() -> PathBuf {
 }
 
 pub(crate) fn on_path(name: &str) -> Option<PathBuf> {
+    on_path_in(name, None)
+}
+
+/// `name` on `path` (default: this process's PATH).
+pub(crate) fn on_path_in(name: &str, path: Option<std::ffi::OsString>) -> Option<PathBuf> {
     let exts: &[&str] = if cfg!(windows) {
         &[".exe", ".cmd", ".bat", ".com"]
     } else {
         &[""]
     };
-    env::split_paths(&env::var_os("PATH")?).find_map(|dir| {
+    let path = path.or_else(|| env::var_os("PATH"))?;
+    env::split_paths(&path).find_map(|dir| {
         exts.iter()
             .map(|e| dir.join(format!("{name}{e}")))
             .find(|p| p.is_file())

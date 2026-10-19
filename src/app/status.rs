@@ -15,6 +15,7 @@ struct Probe {
     latency: Option<u64>,
     opencode: Option<Opencode>,
     mesh: Option<String>,
+    daemon: Option<String>,
 }
 
 fn probe_remote(me: &str, devices: &[crate::model::Device]) -> HashMap<String, Probe> {
@@ -51,6 +52,7 @@ fn probe_remote(me: &str, devices: &[crate::model::Device]) -> HashMap<String, P
                 latency: r.ms.filter(|_| ok),
                 opencode,
                 mesh: d["mesh"].as_str().map(String::from),
+                daemon: d["daemon"].as_str().map(String::from),
             };
             (r.device, probe)
         })
@@ -113,6 +115,11 @@ pub(crate) fn run(target: Option<&str>, exclude: Option<&str>, fast: bool) -> R<
                     local.take()
                 } else {
                     probe.as_ref().and_then(|p| p.opencode.clone())
+                },
+                daemon: if is_me {
+                    probe_self.then(|| if super::daemon::up() { "up" } else { "down" }.into())
+                } else {
+                    probe.as_ref().and_then(|p| p.daemon.clone())
                 },
                 mesh: if is_me {
                     Some(VERSION.to_string())

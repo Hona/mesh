@@ -21,13 +21,13 @@ Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version
 
   up       create a mesh or join this device     mesh up [--repo <owner/name>] [--path <dir>] [--name <device>]
                                                    [--public] [--yes] [--prefer mesh|local] [--check] [--wait]
-                                                   [--skip sshd,mcp,schedule] [--upload-skill <id,...>]
+                                                   [--skip sshd,mcp] [--upload-skill <id,...>]
   sync     pull the mesh and apply it here       mesh sync [--force] [--keys-only]
   rm       remove a device from the mesh         mesh rm <device> [--yes]
   leave    remove this device from the mesh      mesh leave [--yes]
   update   update mesh on every device           mesh update [--version <x.y.z>] [--check]
   status   list devices                          mesh status [<target>] [--fast]
-  exec     run a command on devices              mesh exec [-t] [-w <dir>] [-e K=V]... [--timeout <s>] [--durable] [--no-stall] <target> <cmd> [args…]
+  exec     run a command on devices              mesh exec [-t] [-w <dir>] [-e K=V]... [--timeout <s>] [--no-stall] <target> <cmd> [args…]
                                                  mesh exec [flags] <target> -c '<string>'
                                                  mesh exec [flags] <target> -s          (script on stdin, run by the device's shell)
   cp       copy files between devices            mesh cp [-r] <src> <dst>      (each side: path or <device>:<path>)
@@ -82,7 +82,14 @@ pub fn run(args: Vec<String>) -> i32 {
         "exec" => exec(&rest, &mut out),
         "cp" => cp(&rest),
         "mcp" => Ok(crate::mcp::run()),
-        "mux" => app::mux::run(),
+        // hidden: `--start` makes sure this build's daemon runs (after a binary swap)
+        "daemon" if rest.first().map(String::as_str) == Some("--start") => {
+            match app::daemon::ensure() {
+                None => Ok(0),
+                Some(e) => Err(Fail(1, e)),
+            }
+        }
+        "daemon" => app::daemon::run(crate::mcp::http::serve),
         "elevated" => up::elevated(rest.first().map_or("", String::as_str)),
         "update" => update(&rest),
         "rm" => rm(&rest),
@@ -239,8 +246,6 @@ fn exec(args: &[String], out: &mut Out) -> Result<i32, Fail> {
         match args.get(1).map(String::as_str) {
             Some("--envelope") => return Ok(app::serve::envelope(args.get(2).map(String::as_str))),
             Some("--serve") => return Ok(app::serve::serve()),
-            #[cfg(windows)]
-            Some("--run-queued") => return Ok(app::durable::run_queued()),
             _ => {}
         }
     }
@@ -259,7 +264,6 @@ fn exec(args: &[String], out: &mut Out) -> Result<i32, Fail> {
         };
         match a.as_str() {
             "-t" => tty = true,
-            "--durable" => env.durable = true,
             "--no-stall" => env.stall = false,
             "-w" => env.cwd = Some(value()?),
             "-e" => {
@@ -334,9 +338,6 @@ fn exec(args: &[String], out: &mut Out) -> Result<i32, Fail> {
         return Err(Fail(1, format!("no devices match {target}")));
     }
     if tty {
-        if env.durable {
-            return Err(usage("exec", "--durable can't take a terminal (-t)"));
-        }
         if env.script.is_some() {
             return Err(usage("exec", "-s can't take a terminal (-t)"));
         }
