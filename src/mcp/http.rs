@@ -13,11 +13,15 @@ use std::time::Duration;
 const MAX_HEAD: usize = 64 << 10;
 const MAX_BODY: usize = 16 << 20;
 
-/// Serve `listener` (bound to 127.0.0.1) until it fails; one thread per connection.
+/// Serve `listener` (bound to 127.0.0.1) until it fails, or the daemon is quitting (then the port
+/// is free for its successor at once); one thread per connection.
 pub(crate) fn serve(listener: TcpListener, token: String) {
     let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
     let token = Arc::new(token);
     for s in listener.incoming().flatten() {
+        if crate::app::serve::DRAINING.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
         let token = token.clone();
         std::thread::spawn(move || connection(s, &token, port));
     }

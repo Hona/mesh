@@ -195,16 +195,30 @@ pub(crate) fn run(mcp: McpServer) -> R<i32> {
     if retired > 0 {
         eprintln!("asked {retired} other daemon(s) to quit");
     }
-    match mcp_endpoint(false) {
-        Ok((port, token, _)) => match std::net::TcpListener::bind(("127.0.0.1", port)) {
-            Ok(l) => {
-                eprintln!("mcp on http://127.0.0.1:{port}/mcp");
-                std::thread::spawn(move || mcp(l, token));
+    // MCP: until it can be served, retried every 2 s (`up` sets the endpoint up; a daemon being
+    // retired still holds the port until its commands are done).
+    std::thread::spawn(move || {
+        let mut said = String::new();
+        while !serve::DRAINING.load(std::sync::atomic::Ordering::Relaxed) {
+            let r = mcp_endpoint(false).and_then(|(port, token, _)| {
+                std::net::TcpListener::bind(("127.0.0.1", port))
+                    .map(|l| (port, token, l))
+                    .map_err(|e| format!("127.0.0.1:{port}: {e}"))
+            });
+            match r {
+                Ok((port, token, l)) => {
+                    eprintln!("mcp on http://127.0.0.1:{port}/mcp");
+                    mcp(l, token);
+                }
+                Err(e) if e != said => {
+                    eprintln!("mcp: {e} (retrying)");
+                    said = e;
+                }
+                Err(_) => {}
             }
-            Err(e) => eprintln!("mcp: 127.0.0.1:{port}: {e}"),
-        },
-        Err(e) => eprintln!("mcp: {e}"),
-    }
+            std::thread::sleep(Duration::from_secs(2));
+        }
+    });
     std::thread::spawn(sync_timer);
     let mux = mux::Mux::new(Box::new(dial));
     while let Ok(conn) = listener.accept() {
@@ -268,6 +282,10 @@ fn link(conn: Arc<Conn>, mux: &Arc<mux::Mux>) {
             eprintln!("asked to quit: exiting once idle");
             serve::DRAINING.store(true, std::sync::atomic::Ordering::Relaxed);
             serve::exit_if_drained();
+            // wake the MCP listener so it closes and frees the port for the successor
+            if let Some(p) = store::read_state().ok().and_then(|s| s.mcp_port) {
+                let _ = std::net::TcpStream::connect(("127.0.0.1", p));
+            }
         }
         RESET => mux.reset(),
         _ => local.handle(f),

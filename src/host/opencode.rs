@@ -391,8 +391,13 @@ pub(crate) fn mcp_set_remote(
         let msg = String::from_utf8_lossy(&err).to_string() + &String::from_utf8_lossy(&out);
         return Err(msg.trim().to_string());
     }
-    // `mcp add` has no flag for it: no OAuth discovery for a local server
-    let (path, _) = mcp_doc(name)?.ok_or("`opencode mcp add` wrote no entry")?;
+    // `mcp add` has no flag for it: no OAuth discovery for a local server. The file is the one
+    // it names (`… added to <path>`): a running service may not show the new entry yet.
+    let said = String::from_utf8_lossy(&out);
+    let path = said
+        .rsplit_once(" added to ")
+        .map(|(_, p)| PathBuf::from(p.trim()))
+        .ok_or_else(|| format!("`opencode mcp add` said: {}", said.trim()))?;
     let text = std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
     let new = jsonc_prepend(&text, &["mcp", "servers", name], "\"oauth\": false, ")
         .ok_or_else(|| format!("couldn't find \"{name}\" in {}", path.display()))?;

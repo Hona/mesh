@@ -761,6 +761,13 @@ impl Up<'_> {
                         return;
                     }
                 }
+                // the daemon serves the endpoint within ~2 s of it being set up
+                for _ in 0..50 {
+                    if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
                 match opencode::mcp_set_remote("mesh", &url, &file, &token) {
                     Ok(n) => self.ok(
                         "mcp",

@@ -280,10 +280,13 @@ Steps (each checks first, prints ✓ / ! / ✗):
 9. **MCP** — the global opencode entry `mesh` = `{"type": "remote", "url":
    "http://127.0.0.1:<port>/mcp", "oauth": false, "headers": {"Authorization": "Bearer
    {file:<state>/mcp-token>}"}}`: `opencode mcp add mesh --global --url … --header …`, then
-   `"oauth": false` written into that entry (no flag for it). opencode reads the token from the
-   file, so the config holds no secret (no service environment to set). Then the same entry,
-   token inline, goes live in every loaded location with `opencode api experimental.mcp.add`
-   (`debug.location.list`): no reload. A different `mesh` entry: ask before replacing it.
+   `"oauth": false` written into that entry (no flag for it; the file is the one `mcp add`
+   names: a running service may not show the entry yet). opencode reads the token from the
+   file, so the config holds no secret (no service environment to set). Once the daemon
+   answers on the port (≤ 5 s), the same entry, token inline, goes live in every loaded
+   location with `opencode api experimental.mcp.add` (`debug.location.list`): no reload. This
+   registration is the only per-location step; updates need none. A different `mesh` entry:
+   ask before replacing it.
 10. **Self-test** — via the mesh SSH config to itself: `mesh exec self opencode --version`
     over SSH. Then `exec` a no-op on each online peer; peers that haven't synced yet are
     reported as "pending (≤ interval)".
@@ -703,7 +706,11 @@ caller ──ssh──▶ sshd ──▶ mesh exec self --serve   (relay, inside
   session.
 - **One per user**: a daemon that can't bind its socket (this build already runs) exits. A
   starting daemon asks every other build's daemon to quit (frame `7`); a daemon told to quit
-  exits as soon as no command runs (it still serves its existing connections until then).
+  closes its MCP listener at once (the port is free for its successor) and exits as soon as no
+  command runs (it still serves its existing connections until then).
+- **MCP listener**: bound when `state.json` has a port and `<state>/mcp-token` exists, else (or
+  while the port is taken) retried every 2 s. A request that arrives while no daemon listens
+  fails; the next one after it's back works (verified: opencode needs no reconnect).
 - **Taking over after a new binary** (`daemon --start`, `update`, `up`, a relay or sync that
   finds no daemon of its build): register the autostart, then Windows: run the task (a new
   instance; it retires the old); Linux/macOS: ask the old daemon to quit and start the unit
