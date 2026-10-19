@@ -924,8 +924,14 @@ Text rendering for the model:
   survives the SSH session; `gh` and other credential-store logins work in remote commands.
 - Commands now run with the user's normal (on Windows admins: filtered, non-elevated) token,
   as the user's own programs do; before, an admin's SSH session ran them elevated.
-- macOS: the daemon LaunchAgent and the `launchctl` takeover are untested (air offline); no
-  stall detection there.
+- macOS: no stall detection there.
+- macOS privacy prompts: commands run by the daemon (a LaunchAgent) trigger macOS folder-access
+  prompts (Documents, Downloads, Desktop…) for `mesh`. The "remote users full disk access"
+  switch covers SSH sessions only. Unsigned builds change signature per release, so approvals
+  may be asked again after updates. User accepts clicking Allow for now. Options for later:
+  Developer ID signing + one-time Full Disk Access in `up`; a never-changing launcher that
+  holds the grant; or running commands in the SSH session on macOS (breaks Keychain tools like
+  `gh`).
 - Can `opencode api --data` / `opencode session import` read stdin? If not, large payloads go
   via `mesh cp` + a path.
 - Windows admin keys file + elevated `keys` task end to end: verified on adais (one UAC; the
