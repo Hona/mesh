@@ -428,19 +428,18 @@ fn each_location(name: &str, ops: &[&str]) -> Option<usize> {
     Some(done)
 }
 
-/// Restart MCP server `name` in every loaded opencode location so a replaced binary is used
-/// (`opencode reload` if the locations can't be listed). Ok(n locations).
+/// Restart MCP server `name` in every loaded opencode location so a replaced binary is used.
+/// Ok(n locations); Err(hint) if the locations can't be listed. Never `opencode reload`: it
+/// cancels the tool calls of every running session (SPEC §1.5).
 pub(crate) fn reconnect_mcp(name: &str) -> Result<usize, String> {
     if service().is_none_or(|s| s.exe.is_none()) {
         return Ok(0);
     }
-    match each_location(
+    each_location(
         name,
         &["experimental.mcp.disconnect", "experimental.mcp.connect"],
-    ) {
-        Some(n) => Ok(n),
-        None => reload().map(usize::from),
-    }
+    )
+    .ok_or_else(|| "restart opencode to load the new mesh binary".into())
 }
 
 /// Undo `mcp_add` (mesh leave): cut the entry out of the global config text (only if its command
@@ -602,22 +601,4 @@ fn member(b: &[u8], i: &mut usize, path: &[&str]) -> Option<(usize, usize)> {
             *i += 1;
         }
     }
-}
-
-/// `opencode reload` if the service is running. Ok(false) if it isn't.
-pub(crate) fn reload() -> Result<bool, String> {
-    let svc = service();
-    match state(svc.as_ref()) {
-        ServiceState::Ok => {}
-        ServiceState::Hung => return Err("the opencode service doesn't answer (hung)".into()),
-        _ => return Ok(false),
-    }
-    let (bin, how) = find(svc.as_ref()).ok_or("opencode not found")?;
-    vlog!("opencode: {} ({how})", bin.display());
-    let (ok, _, err) = process::output_within(process::command(bin).arg("reload"), SLOW)
-        .ok_or("`opencode reload` didn't finish in 20 s")?;
-    if !ok {
-        return Err(String::from_utf8_lossy(&err).trim().to_string());
-    }
-    Ok(true)
 }

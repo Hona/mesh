@@ -130,7 +130,6 @@ pub(crate) fn leave(
         "skills/opencode-mesh removed",
         "no mesh skills here",
     );
-    let _ = opencode::reload();
 
     // 3. scheduled sync, keys block (+ the elevated keys task: one UAC on admin Windows)
     report(

@@ -229,7 +229,7 @@ pub(crate) struct SyncReport {
     pub up_to_date: bool,
     /// "+ device air", "~ skill review", "~ AGENTS.md"
     pub changes: Vec<String>,
-    /// Local files regenerated: "ssh config", "known_hosts", "keys", "opencode reload"
+    /// Local files regenerated: "ssh config", "known_hosts", "keys"
     pub applied: Vec<String>,
     pub warnings: Vec<String>,
 }

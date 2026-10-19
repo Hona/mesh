@@ -746,10 +746,7 @@ impl Up<'_> {
                     "mcp",
                     format!("{what} · restarted on the new binary ({n} opencode locations)"),
                 ),
-                Err(e) => up.warn(
-                    "mcp",
-                    format!("{what}, but restarting it failed ({e}): run `opencode reload`"),
-                ),
+                Err(e) => up.warn("mcp", format!("{what} · {e}")),
             }
         };
         match opencode::mcp_entry("mesh") {
@@ -770,10 +767,7 @@ impl Up<'_> {
                     return self.info("mcp", "would register \"mesh\"");
                 }
                 match opencode::mcp_add("mesh", &[&want[0], "mcp"]) {
-                    Ok(()) => {
-                        let _ = opencode::reload();
-                        restart(self, "registered \"mesh\"");
-                    }
+                    Ok(()) => restart(self, "registered \"mesh\""),
                     Err(e) => self.fail("mcp", e),
                 }
             }

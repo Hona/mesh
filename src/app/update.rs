@@ -92,11 +92,11 @@ fn install_version(version: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// sync step 3: move this device to the mesh's pin. No repo writes, no fan-out.
-pub(crate) fn converge(pin: &str) -> Result<(), String> {
+/// sync step 3: move this device to the mesh's pin. No repo writes, no fan-out. Ok(a hint when
+/// the MCP server couldn't be restarted).
+pub(crate) fn converge(pin: &str) -> Result<Option<String>, String> {
     install_version(pin.trim_start_matches('v'))?;
-    let _ = opencode::reconnect_mcp("mesh");
-    Ok(())
+    Ok(opencode::reconnect_mcp("mesh").err())
 }
 
 pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
@@ -204,11 +204,7 @@ pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
                 "mcp",
                 format!("\"mesh\" restarted on {target} ({n} opencode locations)"),
             ),
-            Err(e) => say(
-                "warn",
-                "mcp",
-                format!("couldn't restart \"mesh\" ({e}): run `opencode reload`"),
-            ),
+            Err(e) => say("warn", "mcp", e),
         }
     }
     Ok(if failed { 1 } else { 0 })

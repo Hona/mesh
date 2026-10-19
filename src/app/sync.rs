@@ -2,7 +2,7 @@
 
 use super::store::{self, Index};
 use super::{Fail, R, VERSION};
-use crate::host::{install, opencode, paths, vlog};
+use crate::host::{install, paths, vlog};
 use crate::model::{Device, RepoFile, SyncReport, cmp_versions};
 use crate::{network, registry, transport};
 use std::collections::{BTreeMap, BTreeSet};
@@ -101,15 +101,9 @@ fn run_here(force: bool, keys_only: bool) -> R<SyncReport> {
         client_files(&devices, &mut r)?;
     }
     keys(&devices, &mut r);
-    let skills_changed = skills(index, &mut r)?;
+    // opencode watches the skills folders and AGENTS.md itself: no reload (SPEC §1.5)
+    skills(index, &mut r)?;
     agents(index, &mut r)?;
-    if skills_changed {
-        match opencode::reload() {
-            Ok(true) => r.applied.push("opencode reload".into()),
-            Ok(false) => vlog!("opencode service not running, no reload needed"),
-            Err(e) => r.warnings.push(format!("opencode reload failed: {e}")),
-        }
-    }
     state.synced = Some(commit.clone());
     store::write_state(&state)?;
     r.commit = Some(commit);
@@ -120,7 +114,10 @@ fn run_here(force: bool, keys_only: bool) -> R<SyncReport> {
         .map(|p| p.trim_start_matches('v').to_string());
     if let Some(pin) = pin.filter(|p| cmp_versions(p, VERSION) != std::cmp::Ordering::Equal) {
         match super::update::converge(&pin) {
-            Ok(()) => r.applied.push(format!("mesh {VERSION} → {pin} (pinned)")),
+            Ok(hint) => {
+                r.applied.push(format!("mesh {VERSION} → {pin} (pinned)"));
+                r.warnings.extend(hint.map(|h| format!("mcp: {h}")));
+            }
             Err(e) => r
                 .warnings
                 .push(format!("couldn't move to the pinned mesh {pin}: {e}")),

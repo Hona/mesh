@@ -25,7 +25,9 @@ When a design change is agreed, update this file in the same change.
 5. **Never break user space.** Mesh only adds marked managed blocks or mesh-owned files, all
    removable by `mesh leave`. It never edits `sshd_config`, never changes a default shell, never
    rewrites lines it didn't write. The one deliberate exception: `~/.config/opencode/AGENTS.md`
-   is mesh-owned (see §7.4), with backups.
+   is mesh-owned (see §7.4), with backups. Mesh never reloads or restarts the user's opencode
+   while sessions may be running (`opencode reload` cancels every running tool call), except the
+   explicit, guarded cases in §5.3. OpenCode picks up skill and `AGENTS.md` changes by itself.
 6. **Opt-in targeting.** Commands reach only devices the user names (§5.1).
 7. **Raw, unopinionated tools.** Two MCP tools (`status`, `exec`). No task-specific tools.
    Everything else is composed from `mesh exec <device> opencode …` or plain commands.
@@ -270,8 +272,8 @@ Steps (each checks first, prints ✓ / ! / ✗):
 8. **MCP** — `opencode mcp add mesh --global -- <abs mesh path> mcp`. If a different `mesh`
    MCP entry exists, ask. If `up` just replaced the installed binary, restart the running `mesh`
    MCP servers so none keeps old code: `opencode api experimental.mcp.disconnect` / `connect`
-   (`server=mesh`) in every loaded location (`debug.location.list`; `opencode reload` if that
-   fails).
+   (`server=mesh`) in every loaded location (`debug.location.list`; if that fails:
+   `! mcp  restart opencode to load the new mesh binary`).
 9. **Schedule** — §7.2.
 10. **Self-test** — via the mesh SSH config to itself: `mesh exec self opencode --version`
     over SSH. Then `exec` a no-op on each online peer; peers that haven't synced yet are
@@ -360,7 +362,7 @@ The service state (JSON `opencode.service`) is shown when it isn't `ok`, e.g.
 | `hung` | alive, not answering | pid alive, no HTTP answer within 4 s (connect 1 s; a busy service answered in 1.8 s right after MCP restarts, so 2 s was too tight) |
 
 A raw `TcpStream` with timeouts, no `opencode` spawn. `status` never hangs on a broken opencode:
-every opencode spawn mesh makes (version, busy, config, reload, MCP restarts) has a hard limit
+every opencode spawn mesh makes (version, busy, config, MCP restarts) has a hard limit
 (3 s for status probes, 20 s otherwise) and is skipped when the service doesn't answer.
 Older devices send `service: true|false` (read as `ok` / `down`).
 
@@ -461,7 +463,6 @@ Pull-only. Never writes to the repo.
    - `AGENTS.md` → `~/.config/opencode/AGENTS.md` (§7.4).
 3. If `mesh.json` `pin` differs from this binary's version, self-update to the pin (§5.9 step 1
    + MCP restart; either direction, no repo writes). Leftover `*.old` binaries are deleted.
-4. If skills changed, `opencode reload`.
 
 Prints a short diff (`+ device air`, `~ skill review`, …). Runs on schedule and lazily when a
 target names an unknown device.
