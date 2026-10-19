@@ -741,13 +741,11 @@ impl Up<'_> {
             Err(e) => return self.fail("mcp", e),
         };
         let url = format!("http://127.0.0.1:{port}/mcp");
-        let file_ref = file.display().to_string().replace('\\', "/");
+        // `debug config` shows header values as "***": that one is only checked for presence
         let current = |e: &serde_json::Value| {
             e["url"].as_str() == Some(url.as_str())
                 && e["oauth"] == serde_json::Value::Bool(false)
-                && e["headers"]["Authorization"]
-                    .as_str()
-                    .is_some_and(|a| a.contains(&file_ref) || a == format!("Bearer {token}"))
+                && e["headers"]["Authorization"].is_string()
         };
         match opencode::mcp_entry("mesh") {
             Ok(Some(e)) if current(&e) => self.ok("mcp", format!("\"mesh\" registered · {url}")),
