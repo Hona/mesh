@@ -55,3 +55,4 @@ Handing a task to another device's opencode: `mesh exec server opencode run "pul
 - Offline devices are skipped and reported as offline.
 - `MESH_FROM` (and `MESH_SESSION` from MCP) is set on remote commands: don't send work back to the device that sent it to you.
 - If `mesh` isn't on PATH, use the CLI path from the mesh MCP instructions.
+- `script` and `stdin` reach the device byte for byte, but your own wrapper has to produce them first. PowerShell's backtick (`` `n ``) and `$` clash with JavaScript template strings; for scripts with those, write the file and run `mesh exec <device> -s < file.ps1`, or build a plain string.
