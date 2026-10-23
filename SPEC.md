@@ -683,6 +683,16 @@ Details:
 - Dead links: a link quiet for 20 s is pinged before reuse (one round trip; no answer in 3 s →
   redial transparently). The mux also pings quiet links and kills one that doesn't answer
   within 10 s; its in-flight commands end with exit 255 `connection to <device> lost`.
+- The relay end: a caller that dies silently (sleep, network change) never closes it, and sshd
+  may not notice for hours (seen: 7 relays on air, some a day old). The mux sends a frame at
+  least every ~30 s (a ping when it has sent nothing for 20 s, even while output streams in), so
+  a relay that hears nothing for 120 s exits, stopping that link's commands (a caller that went
+  away mid-command, §5.5).
+- Stale versions: the hello carries the remote relay's mesh version. An idle link whose relay
+  runs another version than this daemon, dialed more than 60 s ago, is redialed before use:
+  after an update elsewhere the relay still runs the old binary (and can fall back to running
+  commands in the SSH session, where macOS `gh` has no keychain). A device not updated yet just
+  redials to the same version, at most once a minute.
 
 ### 6.6 The daemon
 

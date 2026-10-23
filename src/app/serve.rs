@@ -522,6 +522,9 @@ fn oneshot_via(d: mux::Client, mut env: Envelope) -> i32 {
 
 pub(crate) const STALL_HINT: &str = "no output and idle for 20 s; is it waiting for input?";
 
+/// A persistent link's relay exits after this long without a frame from its caller.
+const CALLER_GONE: Duration = Duration::from_secs(120);
+
 /// How long output may still arrive after the command's process exits.
 const DRAIN: Duration = Duration::from_millis(300);
 const HELD: &str = "mesh: a background process still holds stdout/stderr; its later output isn't shown (redirect it to a file)\n";
@@ -736,12 +739,33 @@ pub(crate) fn serve() -> i32 {
         0,
         format!(r#"{{"v":1,"mesh":"{VERSION}"}}"#).as_bytes(),
     );
-    let local = Link::new(out.clone(), "ssh");
+    let local = Arc::new(Link::new(out.clone(), "ssh"));
     let renv = relay_env();
+    // A caller that died silently (slept, lost its network) never closes this end, and the SSH
+    // server may not notice for hours: the caller's mux says something every ≤ 30 s, so a much
+    // longer silence means it's gone. Its commands stop with it (the daemon stops a closed
+    // connection's commands).
+    let t0 = Instant::now();
+    let heard = Arc::new(AtomicU64::new(0));
+    {
+        let (heard, local) = (heard.clone(), local.clone());
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(TICK);
+                let ms = t0.elapsed().as_millis() as u64;
+                if ms.saturating_sub(heard.load(Ordering::Relaxed)) > CALLER_GONE.as_millis() as u64
+                {
+                    local.stop_all();
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
     // when starting the daemon last failed (logged out, disabled): retried after a minute
     let (mut daemon, mut failed) = (None::<Arc<Relayed>>, None::<Instant>);
     let mut input = io::BufReader::with_capacity(frame::CHUNK, io::stdin().lock());
     while let Ok(Some(f)) = frame::read(&mut input) {
+        heard.store(t0.elapsed().as_millis() as u64, Ordering::Relaxed);
         match f.kind {
             START => {
                 if daemon

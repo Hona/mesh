@@ -221,7 +221,7 @@ pub(crate) fn run(mcp: McpServer) -> R<i32> {
         }
     });
     std::thread::spawn(sync_timer);
-    let mux = mux::Mux::new(Box::new(dial));
+    let mux = mux::Mux::new(Box::new(dial), VERSION);
     while let Ok(conn) = listener.accept() {
         let mux = mux.clone();
         std::thread::spawn(move || link(Arc::new(conn), &mux));

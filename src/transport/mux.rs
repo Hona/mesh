@@ -43,6 +43,10 @@ impl Peer {
 const QUIET: Duration = Duration::from_secs(20);
 /// A link nothing used for this long is closed (the remote serve process exits with it).
 const IDLE: Duration = Duration::from_secs(600);
+/// An idle link whose remote runs another mesh version is redialed, at most this often (after
+/// an update the remote relay still runs the old binary; a device not updated yet redials to
+/// the same version, so not on every command).
+const STALE: Duration = Duration::from_secs(60);
 
 /// One device's persistent link.
 struct Link {
@@ -53,12 +57,18 @@ struct Link {
     alive: AtomicBool,
     last_rx: Mutex<Instant>,
     ping_sent: Mutex<Option<Instant>>,
+    /// Last frame sent: the remote relay exits after a long silence from us (SPEC §6.5).
+    last_tx: Mutex<Instant>,
     /// Last command started or output relayed.
     last_use: Mutex<Instant>,
+    /// The remote relay's mesh version (its hello) and when it was dialed.
+    version: String,
+    dialed: Instant,
 }
 
 impl Link {
     fn send(&self, kind: u8, id: u32, data: &[u8]) -> io::Result<()> {
+        *lock(&self.last_tx) = Instant::now();
         frame::write(&mut *lock(&self.input), kind, id, data)
     }
 
@@ -86,15 +96,18 @@ impl Link {
 
 pub(crate) struct Mux {
     dial: Dial,
+    /// This build's mesh version: what every device converges to.
+    version: &'static str,
     links: Mutex<HashMap<String, Arc<Link>>>,
     dialing: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 impl Mux {
     /// A mux; a background thread pings quiet links and closes idle ones.
-    pub(crate) fn new(dial: Dial) -> Arc<Mux> {
+    pub(crate) fn new(dial: Dial, version: &'static str) -> Arc<Mux> {
         let mux = Arc::new(Mux {
             dial,
+            version,
             links: Mutex::new(HashMap::new()),
             dialing: Mutex::new(HashMap::new()),
         });
@@ -121,6 +134,15 @@ impl Mux {
             .get(dev)
             .filter(|l| l.alive.load(Ordering::Relaxed))
             .cloned()?;
+        if l.version != self.version && l.dialed.elapsed() > STALE && lock(&l.routes).is_empty() {
+            eprintln!(
+                "link {dev} runs mesh {}, this is {}: redialing",
+                l.version, self.version
+            );
+            l.kill();
+            lock(&self.links).remove(dev);
+            return None;
+        }
         if lock(&l.last_rx).elapsed() < QUIET || l.ping(Duration::from_secs(3)) {
             return Some(l);
         }
@@ -139,6 +161,11 @@ impl Mux {
                 continue;
             }
             if lock(&l.last_rx).elapsed() < QUIET {
+                // busy with output: still say something now and then, so the remote relay
+                // knows we're here
+                if lock(&l.last_tx).elapsed() >= QUIET {
+                    let _ = l.send(PING, 0, &[]);
+                }
                 continue;
             }
             let sent = *lock(&l.ping_sent);
@@ -195,8 +222,14 @@ impl Mux {
             }
         });
         let mut reader = BufReader::with_capacity(frame::CHUNK, output);
-        match frame::read(&mut reader) {
-            Ok(Some(f)) if f.kind == HELLO => hello.store(true, Ordering::Relaxed),
+        let version = match frame::read(&mut reader) {
+            Ok(Some(f)) if f.kind == HELLO => {
+                hello.store(true, Ordering::Relaxed);
+                serde_json::from_slice::<serde_json::Value>(&f.data)
+                    .ok()
+                    .and_then(|h| h["mesh"].as_str().map(String::from))
+                    .unwrap_or_default()
+            }
             _ => {
                 hello.store(true, Ordering::Relaxed);
                 let _ = lock(&child).kill();
@@ -210,8 +243,11 @@ impl Mux {
                     .to_string();
                 return Err(format!("{dev}: {msg}"));
             }
-        }
-        eprintln!("link {dev} up in {} ms", started.elapsed().as_millis());
+        };
+        eprintln!(
+            "link {dev} up in {} ms (mesh {version})",
+            started.elapsed().as_millis()
+        );
         let link = Arc::new(Link {
             input: Mutex::new(input),
             child,
@@ -220,7 +256,10 @@ impl Mux {
             alive: AtomicBool::new(true),
             last_rx: Mutex::new(Instant::now()),
             ping_sent: Mutex::new(None),
+            last_tx: Mutex::new(Instant::now()),
             last_use: Mutex::new(Instant::now()),
+            version,
+            dialed: Instant::now(),
         });
         lock(&self.links).insert(dev.to_string(), link.clone());
         let (mux, l, name) = (self.clone(), link.clone(), dev.to_string());
