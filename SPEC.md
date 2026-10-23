@@ -568,9 +568,12 @@ is the highest release, counting prereleases only when this build is one.
 - Step 1 downloads `mesh-<os>-<arch>[.exe]` (+ `meshw-…` on Windows) and `SHA256SUMS` into
   `<state>/update/`, then swaps them in at the §4.4 install path. Steps 2–4 run in the new
   binary (`mesh update --version <v> --resume`), so the skill it pushes is the new one.
-- Run on a device by another device's step 3 (`MESH_FROM` is set), `update` runs a sync there:
-  the caller already pushed the pin, so it converges to it (§5.6 step 3), and reports the new
-  version. No repo writes, no further fan-out.
+- Run on a device by another device's step 3 (`MESH_UPDATE_FROM=<caller>` is set, by that
+  exec's `env` only), `update` runs a sync there: the caller already pushed the pin, so it
+  converges to it (§5.6 step 3), and reports the new version. No repo writes, no further
+  fan-out. Not keyed on `MESH_FROM`: that leaks into what remote commands start (an opencode
+  service restarted over mesh passed it to every shell it opened, and a local `mesh update`
+  there refused to run).
 - Pin and skill go in one commit; nothing is committed when both are already current.
 - No compatibility across breaking releases (§1.12): re-run `up` on each device instead.
 

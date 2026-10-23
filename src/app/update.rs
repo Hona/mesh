@@ -11,6 +11,13 @@ use std::fs;
 /// Where mesh releases are published.
 const TOOL_REPO: &str = "Hona/mesh";
 
+/// Set (to the calling device) only on the `mesh update` another device's fan-out starts.
+const FANOUT: &str = "MESH_UPDATE_FROM";
+
+fn fanned_out() -> bool {
+    std::env::var_os(FANOUT).is_some()
+}
+
 pub(crate) struct Opts {
     pub version: Option<String>,
     pub check: bool,
@@ -155,8 +162,9 @@ pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
         return Ok(0);
     }
     // Run by another device's fan-out: the caller already pushed the pin, so a sync converges
-    // to it (§5.6 step 3).
-    if std::env::var_os("MESH_FROM").is_some() && !o.resume {
+    // to it (§5.6 step 3). Not `MESH_FROM`: it leaks into whatever a remote command starts (an
+    // opencode service restarted over mesh hands it to every shell it opens).
+    if fanned_out() && !o.resume {
         let rep = sync::run(false, false)?;
         for line in rep.changes.iter().chain(&rep.applied) {
             say("ok", "sync", line.clone());
@@ -206,7 +214,7 @@ pub(crate) fn run(o: &Opts, step: &dyn Fn(Step)) -> R<i32> {
     }
     let mut failed = false;
     // Run on another device by its `mesh update` fan-out: just this device.
-    if std::env::var_os("MESH_FROM").is_none() {
+    if !fanned_out() {
         publish(&state, &target, &say)?;
         failed = fan_out(&state.device, &target, &say);
         // The links run the devices' pre-update mesh; the next command redials.
@@ -275,6 +283,7 @@ fn fan_out(me: &str, version: &str, say: &dyn Fn(&'static str, &str, String)) ->
         .to_vec();
     let env = Envelope {
         argv: Some(argv),
+        env: [(FANOUT.to_string(), me.to_string())].into(),
         timeout: Some(300.0),
         ..Default::default()
     };
