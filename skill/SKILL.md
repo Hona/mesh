@@ -50,6 +50,8 @@ A machine outside the mesh, through a device that can reach it: `mesh_exec { "ta
 
 Handing a task to another device's opencode: `mesh exec server opencode run "pull main and run the tests"` (with `-w <dir>` for the project).
 
+Long jobs: start them in the background with their output in a file (`nohup … > log 2>&1 &`, `Start-Process … -RedirectStandardOutput log`) and read the log later, or use `opencode api shell.create` on that device.
+
 ## Notes
 
 - Offline devices are skipped and reported as offline.
