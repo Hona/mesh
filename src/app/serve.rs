@@ -522,6 +522,10 @@ fn oneshot_via(d: mux::Client, mut env: Envelope) -> i32 {
 
 pub(crate) const STALL_HINT: &str = "no output and idle for 20 s; is it waiting for input?";
 
+/// How long output may still arrive after the command's process exits.
+const DRAIN: Duration = Duration::from_millis(300);
+const HELD: &str = "mesh: a background process still holds stdout/stderr; its later output isn't shown (redirect it to a file)\n";
+
 fn stall_kill(k: &process::Killer, ended: &AtomicU8) {
     if ended
         .compare_exchange(RAN, STALL_KILL, Ordering::Relaxed, Ordering::Relaxed)
@@ -814,17 +818,26 @@ fn start(
         _ => None,
     };
     let written = Arc::new(AtomicU64::new(0));
-    let mut pumps = Vec::new();
+    // Set once the exit frame is out: output after it (a background child still holding the
+    // pipe) is read and dropped, so the child never blocks on a full pipe.
+    let closed = Arc::new(Mutex::new(false));
+    let (eof_tx, eof_rx) = mpsc::channel::<()>();
     for (mut r, kind) in [(stdout, STDOUT), (stderr, STDERR)] {
-        let (out, written) = (out.clone(), written.clone());
-        pumps.push(std::thread::spawn(move || {
+        let (out, written, closed, eof) =
+            (out.clone(), written.clone(), closed.clone(), eof_tx.clone());
+        std::thread::spawn(move || {
             let mut buf = vec![0u8; frame::CHUNK];
             while let Ok(n @ 1..) = r.read(&mut buf) {
-                written.fetch_add(n as u64, Ordering::Relaxed);
-                send(&out, kind, id, &buf[..n]);
+                let closed = lock(&closed);
+                if !*closed {
+                    written.fetch_add(n as u64, Ordering::Relaxed);
+                    send(&out, kind, id, &buf[..n]);
+                }
             }
-        }));
+            let _ = eof.send(());
+        });
     }
+    drop(eof_tx);
     let ended = Arc::new(AtomicU8::new(RAN));
     let k = killer.clone();
     RUNNING.fetch_add(1, Ordering::Relaxed);
@@ -850,8 +863,16 @@ fn start(
         if how == RAN {
             killer.release();
         }
-        for p in pumps {
-            let _ = p.join();
+        // The command ends with its process (SPEC §5.5): drain what it wrote, but don't wait
+        // for a background child that inherited stdout/stderr to close them.
+        let deadline = Instant::now() + DRAIN;
+        let held = (0..2).any(|_| {
+            eof_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                == Err(mpsc::RecvTimeoutError::Timeout)
+        });
+        let mut closed = lock(&closed);
+        if held {
+            send(&out, STDERR, id, HELD.as_bytes());
         }
         drop(file);
         lock(&table).remove(&id);
@@ -865,6 +886,8 @@ fn start(
             _ => exit_frame(code(st), None, via),
         };
         send(&out, EXIT, id, &exit);
+        *closed = true;
+        drop(closed);
         RUNNING.fetch_sub(1, Ordering::Relaxed);
         exit_if_drained();
     });

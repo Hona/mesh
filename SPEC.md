@@ -412,6 +412,12 @@ mesh exec [flags] <target> -s            # script on stdin
 - The tree is killed **only** on timeout, cancel (Ctrl-C, MCP cancel) or the client going away
   mid-command. A command that exits by itself leaves what it started running (Windows: the job
   stops being kill-on-close; it allows breakaway).
+- A command ends when its process exits, not when its stdout/stderr close: output still in the
+  pipes is drained for ≤ 300 ms, then the exit is sent. A background child that inherited the
+  pipes doesn't hold the result (its later output is read and dropped, so it never blocks on a
+  full pipe); the result's stderr then ends with `mesh: a background process still holds
+  stdout/stderr; its later output isn't shown (redirect it to a file)`. Without this, `sleep 60 &`
+  held the call until the caller's backstop, with the timeout already cancelled.
 - Commands run in the device's daemon (§6.6), in the user's own login session: what they start
   outlives the SSH session, and the OS credential store (`gh`'s login) works. Their base
   environment: Linux/macOS, the user's login shell's, as in a new terminal (`<shell> -l -i -c
