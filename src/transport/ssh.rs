@@ -245,15 +245,18 @@ fn keys_file() -> Result<PathBuf, String> {
     keys_path()
 }
 
+fn sshd_config() -> PathBuf {
+    if cfg!(windows) {
+        program_data().join(r"ssh\sshd_config")
+    } else {
+        PathBuf::from("/etc/ssh/sshd_config")
+    }
+}
+
 fn keys_path() -> Result<PathBuf, String> {
     let home = paths::home();
     let program_data = program_data();
-    let config = if cfg!(windows) {
-        program_data.join(r"ssh\sshd_config")
-    } else {
-        PathBuf::from("/etc/ssh/sshd_config")
-    };
-    let text = fs::read_to_string(&config).unwrap_or_else(|_| {
+    let text = fs::read_to_string(sshd_config()).unwrap_or_else(|_| {
         if cfg!(windows) {
             WINDOWS_DEFAULT_CONFIG.into()
         } else {
@@ -287,16 +290,7 @@ fn keys_path() -> Result<PathBuf, String> {
 fn configured(text: &str, admin: bool) -> Option<String> {
     let (mut global, mut matched) = (None, None);
     let mut block: Option<bool> = None;
-    for line in text.lines().map(str::trim) {
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let (key, val) = line
-            .split_once(|c: char| c.is_whitespace() || c == '=')
-            .unwrap_or((line, ""));
-        let val = val
-            .trim_start_matches(|c: char| c.is_whitespace() || c == '=')
-            .trim();
+    for (key, val) in text.lines().filter_map(directive) {
         if key.eq_ignore_ascii_case("Match") {
             let w: Vec<&str> = val.split_whitespace().collect();
             block = Some(match w.as_slice() {
@@ -318,6 +312,62 @@ fn configured(text: &str, admin: bool) -> Option<String> {
         }
     }
     matched.or(global)
+}
+
+/// `Key value` or `Key=value` from one sshd_config line; None for blanks and comments.
+fn directive(line: &str) -> Option<(&str, &str)> {
+    let line = line.trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (key, val) = line
+        .split_once(|c: char| c.is_whitespace() || c == '=')
+        .unwrap_or((line, ""));
+    let val = val
+        .trim_start_matches(|c: char| c.is_whitespace() || c == '=')
+        .trim();
+    Some((key, val))
+}
+
+/// Windows closes a listening socket when its address goes away, so an sshd pinned to specific
+/// addresses (global `ListenAddress`, e.g. the Tailscale IP) keeps running but stops answering
+/// after a Tailscale restart or update, until sshd restarts. Mesh never edits sshd_config
+/// (SPEC §1.5): `up` and `status` report it with the fix (SPEC §7.1).
+pub(crate) fn pinned_listen() -> Option<String> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let path = sshd_config();
+    let text = fs::read_to_string(&path).ok()?;
+    let hosts: Vec<&str> = text
+        .lines()
+        .filter_map(directive)
+        .take_while(|(k, _)| !k.eq_ignore_ascii_case("Match"))
+        .filter(|(k, _)| k.eq_ignore_ascii_case("ListenAddress"))
+        .filter_map(|(_, v)| v.split_whitespace().next())
+        .map(listen_host)
+        .collect();
+    if hosts.is_empty() || hosts.iter().any(|h| *h == "0.0.0.0" || *h == "::") {
+        return None;
+    }
+    Some(format!(
+        "listens only on {}: it stops answering when that address goes away (a Tailscale \
+         restart or update) until sshd restarts; remove ListenAddress from {} and limit port 22 \
+         with the firewall",
+        hosts.join(", "),
+        path.display()
+    ))
+}
+
+/// The address of a `ListenAddress` value: `host`, `host:port`, `[v6]:port` or a bare IPv6.
+fn listen_host(v: &str) -> &str {
+    if let Some(rest) = v.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match v.split_once(':') {
+        Some((host, port)) if !port.contains(':') => host,
+        _ => v,
+    }
 }
 
 // ---- client commands ----------------------------------------------------------------

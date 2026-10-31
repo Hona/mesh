@@ -222,6 +222,9 @@ pub(crate) struct DeviceStatus {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub daemon: Option<String>,
     pub mesh: Option<String>,
+    /// A problem with the device's SSH server that mesh reports but never fixes (SPEC §7.1).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sshd: Option<String>,
 }
 
 #[derive(Serialize)]

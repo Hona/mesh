@@ -357,7 +357,8 @@ air      macos    zsh         no      -         -     -       -
 ```
 
 Also shows: pending binary updates (`0.1.0 → 0.2.0 (pending)`), a customised mesh skill,
-local `AGENTS.md` edits that were backed up, last sync time/commit.
+local `AGENTS.md` edits that were backed up, last sync time/commit, and a probed device whose
+sshd is pinned to specific addresses (JSON `sshd`, §7.1).
 
 OPENCODE is the version of the opencode `mesh exec <device> opencode` would run (§6.4). If the
 running service is a different version it is appended, `2.0.28 (service 0.0.0-beta-21153)`
@@ -755,6 +756,14 @@ Adapt to what exists; never reconfigure an existing server.
 | macOS | Open Sharing settings; user turns on **Remote Login** | Also require **"Allow full disk access for remote users"** (otherwise remote commands can't read `~/Documents`, `~/Desktop`); open the exact pane, wait, re-verify via SSH to self |
 | Linux | One sudo: install via detected package manager | `loginctl enable-linger $USER` (the user service survives logout); detect login shell |
 
+Windows closes a listening socket when its address goes away, so an sshd pinned to specific
+addresses with a global `ListenAddress` (typically the Tailscale IP) keeps running but stops
+answering after every Tailscale restart or update, until sshd restarts (seen on blade). Mesh
+doesn't fix it (no `sshd_config` edits, §1.5): `up` warns and `status` reports it (a file read,
+no spawn): `listens only on <addrs>: …; remove ListenAddress from <path> and limit port 22 with
+the firewall`. A wildcard (`0.0.0.0`, `::`) among them is fine. Checked on Windows only, where
+it was seen.
+
 The device's `.host.pub` is read from the server's `ssh_host_ed25519_key.pub`; where that needs
 admin to read (Windows), `up` asks the running server instead (`ssh-keyscan 127.0.0.1`).
 The one elevated step on Windows is `meshw elevated <hex plan>` via a single UAC prompt; if it's
@@ -852,6 +861,7 @@ ssh-ed25519 AAAA… opencode-mesh:air
       "opencode": { "version": "2.0.32", "busy": 1, "service": "ok" }, "daemon": "up",
       "mesh": "0.1.0" } ] }
 // "service": "ok" | "down" | "stale" | "hung" (§5.4)
+// "sshd": "listens only on …" — present only for a pinned Windows sshd (§7.1)
 ```
 
 ### 8.2 `exec`

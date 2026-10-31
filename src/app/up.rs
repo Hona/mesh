@@ -509,6 +509,9 @@ impl Up<'_> {
                 ""
             };
             self.ok("sshd", format!("running · keys: {file}{managed}"));
+            if let Some(w) = ssh::pinned_listen() {
+                self.warn("sshd", w);
+            }
             Ok(srv.keys_admin)
         }
         #[cfg(target_os = "macos")]

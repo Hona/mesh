@@ -126,6 +126,11 @@ pub(crate) fn status_text(s: &Status) -> String {
         (Some(c), None) => format!("\nsynced {}\n", &c[..c.len().min(7)]),
         (None, _) => "\nnever synced\n".into(),
     };
+    for d in &s.devices {
+        if let Some(w) = &d.sshd {
+            text += &format!("! {}: sshd {w}\n", d.name);
+        }
+    }
     if let Some(b) = &s.agents_backup {
         text += &format!("! local AGENTS.md edits were backed up to {b}\n");
     }

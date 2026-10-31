@@ -7,6 +7,7 @@ use super::{Fail, R, VERSION, skill, store};
 use crate::host::opencode;
 use crate::model::{DeviceStatus, Envelope, Opencode, ServiceState, Status};
 use crate::network;
+use crate::transport::ssh;
 use std::collections::HashMap;
 
 /// What a remote `mesh status self --json` said about itself.
@@ -16,6 +17,7 @@ struct Probe {
     opencode: Option<Opencode>,
     mesh: Option<String>,
     daemon: Option<String>,
+    sshd: Option<String>,
 }
 
 fn probe_remote(me: &str, devices: &[crate::model::Device]) -> HashMap<String, Probe> {
@@ -53,6 +55,7 @@ fn probe_remote(me: &str, devices: &[crate::model::Device]) -> HashMap<String, P
                 opencode,
                 mesh: d["mesh"].as_str().map(String::from),
                 daemon: d["daemon"].as_str().map(String::from),
+                sshd: d["sshd"].as_str().map(String::from),
             };
             (r.device, probe)
         })
@@ -120,6 +123,11 @@ pub(crate) fn run(target: Option<&str>, exclude: Option<&str>, fast: bool) -> R<
                     probe_self.then(|| if super::daemon::up() { "up" } else { "down" }.into())
                 } else {
                     probe.as_ref().and_then(|p| p.daemon.clone())
+                },
+                sshd: if is_me {
+                    probe_self.then(ssh::pinned_listen).flatten()
+                } else {
+                    probe.as_ref().and_then(|p| p.sshd.clone())
                 },
                 mesh: if is_me {
                     Some(VERSION.to_string())
