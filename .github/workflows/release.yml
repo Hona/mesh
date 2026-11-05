@@ -58,6 +58,31 @@ jobs:
             cargo build --release --bin mesh --target "${t%%:*}-apple-darwin"
             cp "target/${t%%:*}-apple-darwin/release/mesh" "dist/mesh-macos-${t##*:}"
           done
+      # One self-signed identity for every release, so TCC grants survive updates (SPEC §10).
+      - name: Sign
+        env:
+          P12: ${{ secrets.MACOS_SIGN_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_SIGN_P12_PASSWORD }}
+        run: |
+          if [ -z "$P12" ]; then
+            echo "::warning::MACOS_SIGN_P12 isn't set: the macOS binaries keep their ad-hoc signature, so macOS privacy grants (Accessibility, Screen Recording, folders) reset on every update"
+            exit 0
+          fi
+          kc="$RUNNER_TEMP/sign.keychain-db"
+          pw=$(uuidgen)
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          printf %s "$P12" | base64 --decode > "$RUNNER_TEMP/sign.p12"
+          security import "$RUNNER_TEMP/sign.p12" -k "$kc" -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
+          rm "$RUNNER_TEMP/sign.p12"
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc" >/dev/null
+          for f in dist/mesh-macos-*; do
+            codesign -f -s "opencode mesh" --keychain "$kc" -i opencode.mesh --timestamp=none "$f"
+            codesign -v --strict "$f"
+            codesign -d -r- "$f"
+          done
+          security delete-keychain "$kc"
       - uses: actions/upload-artifact@v4
         with:
           name: macos
