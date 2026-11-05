@@ -426,7 +426,8 @@ mesh exec [flags] <target> -s            # script on stdin
   again only when a profile file's mtime changes: `~/.zshenv`, `.zprofile`, `.zshrc`, `.zlogin`,
   `.bash_profile`, `.bash_login`, `.bashrc`, `.profile`, fish `config.fish`, `/etc/zprofile`,
   `/etc/profile`, `/etc/paths`: stat only, no spawn per command); Windows, the SSH session's
-  (built fresh from the registry), minus `SSH_*` / `XDG_SESSION_*`. On top: `NO_COLOR`/`TERM`,
+  (built fresh from the registry), minus `SSH_*` / `XDG_SESSION_*` and sshd's `SHELL` / `PROMPT`
+  (`SHELL` would make tools such as opencode pick `cmd.exe`). On top: `NO_COLOR`/`TERM`,
   `-e`, `MESH_FROM`, `MESH_SESSION` (with `-t`, the terminal's `TERM`/`COLORTERM`). Daemon
   unreachable (nobody logged on, crashed and not restartable): they run in the SSH session as a
   fallback. Each result says where: `"via": "daemon" | "ssh"` (text: `· via ssh (its daemon is

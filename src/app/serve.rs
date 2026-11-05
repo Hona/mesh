@@ -658,12 +658,16 @@ fn watch_stalls(table: std::sync::Weak<Mutex<HashMap<u32, Running>>>) {
 }
 
 /// The SSH session's environment, minus what only describes that session: the daemon starts
-/// relayed commands with it, as they'd have had in the session (fresh PATH and all).
+/// relayed commands with it, as they'd have had in the session (fresh PATH and all). Windows
+/// sshd also sets `SHELL` (its DefaultShell, `cmd.exe` unless configured) and `PROMPT`, which
+/// Windows has nowhere else: tools that honour `SHELL` (opencode) would pick `cmd.exe`.
 pub(crate) fn relay_env() -> std::collections::BTreeMap<String, String> {
     std::env::vars()
         .filter(|(k, _)| {
             let k = k.to_ascii_uppercase();
-            !k.starts_with("SSH_") && !k.starts_with("XDG_SESSION_")
+            !k.starts_with("SSH_")
+                && !k.starts_with("XDG_SESSION_")
+                && !(cfg!(windows) && (k == "SHELL" || k == "PROMPT"))
         })
         .collect()
 }
