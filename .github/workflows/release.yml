@@ -77,8 +77,12 @@ jobs:
           security import "$RUNNER_TEMP/sign.p12" -k "$kc" -P "$P12_PASSWORD" -T /usr/bin/codesign >/dev/null
           rm "$RUNNER_TEMP/sign.p12"
           security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          # by hash: an untrusted self-signed identity isn't found by name on every macOS
+          id=$(security find-identity "$kc" | awk '/"opencode mesh"/ {print $2; exit}')
+          if [ -z "$id" ]; then security find-identity "$kc"; exit 1; fi
           for f in dist/mesh-macos-*; do
-            codesign -f -s "opencode mesh" --keychain "$kc" -i opencode.mesh --timestamp=none "$f"
+            codesign -f -s "$id" --keychain "$kc" -i opencode.mesh --timestamp=none "$f"
             codesign -v --strict "$f"
             codesign -d -r- "$f"
           done
