@@ -70,6 +70,23 @@ pub(crate) fn installed_copy() -> Option<PathBuf> {
     same(&exe, &installed).then_some(installed)
 }
 
+/// This process runs from the install dir, but the installed binary is another build: it was
+/// swapped since (an update), so this one's autostart template is out of date. One file read:
+/// the installed file contains its build id (`build`) as a literal.
+pub(crate) fn swapped(build: &str) -> bool {
+    let Some(here) = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent()?.canonicalize().ok())
+    else {
+        return false;
+    };
+    if dir().canonicalize().ok() != Some(here) {
+        return false;
+    }
+    fs::read(dir().join(names()[0]))
+        .is_ok_and(|b| !b.windows(build.len()).any(|w| w == build.as_bytes()))
+}
+
 /// Copy `src` over `dst`; a running `dst` (Windows) is renamed aside first.
 pub(crate) fn replace(src: &Path, dst: &Path) -> Result<(), String> {
     let name = dst
