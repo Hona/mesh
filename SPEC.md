@@ -778,7 +778,7 @@ runs the periodic sync.
 | OS | Mechanism |
 |---|---|
 | Linux | systemd user service `opencode-mesh.service`: `ExecStart=<mesh> daemon`, `Restart=always`, `RestartSec=1`, `KillMode=process` (stopping the daemon never kills what its commands started), `WantedBy=default.target` (linger keeps it running without a login) |
-| macOS | LaunchAgent `opencode-mesh.daemon`: `RunAtLoad`, `KeepAlive` |
+| macOS | LaunchAgent `opencode-mesh.daemon`: `RunAtLoad`, `KeepAlive`, `ProcessType Interactive` (commands inherit the job's resource policy: without it launchd throttles their CPU and I/O and coalesces their timers, so they run slower than in the user's terminal) |
 | Windows | Task Scheduler `\opencode-mesh\daemon`, "run only when user is logged on": at this user's logon and every `interval` (a running daemon makes that instance exit at once), parallel instances, no time limit, priority 5 (normal: commands inherit it), action `meshw.exe daemon` |
 
 `meshw.exe` is the windowless (`windows_subsystem = "windows"`) build of the same code — the
