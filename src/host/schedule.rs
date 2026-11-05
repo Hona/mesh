@@ -316,6 +316,7 @@ pub(crate) fn ensure_daemon(mesh: &Path, _every_secs: u64, check: bool) -> Resul
   <key>ProgramArguments</key><array><string>{}</string><string>daemon</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
 </dict></plist>
