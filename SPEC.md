@@ -924,6 +924,18 @@ Text rendering for the model:
   the tag already exists, its assets are replaced with `--clobber`). **No test steps.**
   Releases come only from CI: bump `Cargo.toml`, push the tag, wait for the run
   (`gh run watch`), then `mesh update`. The pin always names a CI-built release.
+- macOS signing: CI signs both macOS binaries with one self-signed code-signing identity
+  (`CN=opencode mesh`, repo secrets `MACOS_SIGN_P12` (base64 PKCS#12) and
+  `MACOS_SIGN_P12_PASSWORD`; imported into a throwaway keychain on the runner), identifier
+  `opencode.mesh`, no timestamp, no hardened runtime. The designated requirement is then
+  `identifier "opencode.mesh" and certificate leaf = H"<cert sha1>"`, the same for every
+  release, so the TCC grants (Accessibility, Screen Recording, folder access) a user gives
+  `~/.local/bin/mesh` survive updates. The linker's ad-hoc signature (identifier
+  `mesh-<hash>`) pins its requirement to the build's cdhash, so every update silently voided
+  them. The certificate needs no trust (TCC only evaluates the stored requirement, and an
+  untrusted leaf satisfies it); devices sign nothing and need no keychain. Never replace the
+  certificate: a new one voids every grant once. Secret missing: the release keeps the ad-hoc
+  signature, with a workflow warning; a signing error fails the release.
 - Install, macOS/Linux:
   `gh api repos/Hona/mesh/contents/install.sh -H "Accept: application/vnd.github.raw" | sh`
 - Install, Windows:
@@ -957,11 +969,9 @@ Text rendering for the model:
 - macOS: no stall detection there.
 - macOS privacy prompts: commands run by the daemon (a LaunchAgent) trigger macOS folder-access
   prompts (Documents, Downloads, Desktop…) for `mesh`. The "remote users full disk access"
-  switch covers SSH sessions only. Unsigned builds change signature per release, so approvals
-  may be asked again after updates. User accepts clicking Allow for now. Options for later:
-  Developer ID signing + one-time Full Disk Access in `up`; a never-changing launcher that
-  holds the grant; or running commands in the SSH session on macOS (breaks Keychain tools like
-  `gh`).
+  switch covers SSH sessions only. Releases are signed with one stable identity (§10), so an
+  approval survives updates (before, ad-hoc builds lost every grant on each update). Still to
+  decide: a one-time Full Disk Access step in `up`.
 - Can `opencode api --data` / `opencode session import` read stdin? If not, large payloads go
   via `mesh cp` + a path.
 - Windows admin keys file + elevated `keys` task end to end: verified on adais (one UAC; the
