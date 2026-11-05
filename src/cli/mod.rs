@@ -84,7 +84,7 @@ pub fn run(args: Vec<String>) -> i32 {
         "mcp" => Ok(crate::mcp::run()),
         // hidden: `--start` makes sure this build's daemon runs (after a binary swap)
         "daemon" if rest.first().map(String::as_str) == Some("--start") => {
-            match app::daemon::ensure() {
+            match app::daemon::ensure_here() {
                 None => Ok(0),
                 Some(e) => Err(Fail(1, e)),
             }

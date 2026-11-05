@@ -741,7 +741,10 @@ caller ──ssh──▶ sshd ──▶ mesh exec self --serve   (relay, inside
 - **Taking over after a new binary** (`daemon --start`, `update`, `up`, a relay or sync that
   finds no daemon of its build): register the autostart, then Windows: run the task (a new
   instance; it retires the old); Linux/macOS: ask the old daemon to quit and start the unit
-  (systemd/launchd starts the new binary once the old one exits).
+  (systemd/launchd starts the new binary once the old one exits). A process whose binary was
+  swapped since it started (it runs from the install dir, and the installed file doesn't
+  contain its build id: one file read) never registers the autostart itself, because its
+  template is out of date; it runs `<installed mesh> daemon --start` instead.
 - **Idle cost**: blocked threads, a 10 s link-watch tick, the sync timer. Measured idle private
   memory: see §12.
 

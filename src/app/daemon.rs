@@ -73,6 +73,19 @@ pub(crate) fn ensure() -> Option<String> {
     if up() {
         return None;
     }
+    // A relay or CLI left over from before a binary swap would register its outdated autostart
+    // (and restart the daemon with it): the installed build takes over instead.
+    if install::swapped(exec::BUILD) {
+        return super::update::start_new_daemon().err();
+    }
+    ensure_here()
+}
+
+/// `ensure` for this build itself (`daemon --start`, run by the installed binary).
+pub(crate) fn ensure_here() -> Option<String> {
+    if up() {
+        return None;
+    }
     if let Err(e) = install(false) {
         return Some(e);
     }

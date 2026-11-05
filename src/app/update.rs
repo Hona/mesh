@@ -107,7 +107,7 @@ pub(crate) fn converge(pin: &str) -> Result<(), String> {
 }
 
 /// Have the installed binary start its own daemon, which retires this one.
-fn start_new_daemon() -> Result<(), String> {
+pub(crate) fn start_new_daemon() -> Result<(), String> {
     let mesh = install::dir().join(install::names()[0]);
     match process::output_within(
         process::command(&mesh).args(["daemon", "--start"]),
