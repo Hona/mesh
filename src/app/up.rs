@@ -624,18 +624,30 @@ impl Up<'_> {
             (_, Some(_)) => self.ok("AGENTS.md", "matches the mesh"),
             (_, None) => self.ok("AGENTS.md", "not in the mesh; local file left alone"),
         }
-        let skills = cfg.join("skills");
-        for e in fs::read_dir(&skills).into_iter().flatten().flatten() {
+        let skills: Vec<_> = fs::read_dir(cfg.join("skills"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter(|e| e.file_name() != "opencode-mesh" && e.path().is_dir())
+            .collect();
+        // One answer up front can upload them all; otherwise each skill is asked about.
+        let all = !skills.is_empty()
+            && self.choose(
+                &format!(
+                    "local skills ({}): [a]sk for each / [u]pload all (replaces same-ID mesh skills)",
+                    skills.len()
+                ),
+                "au",
+                'a',
+            ) == 'u';
+        for e in skills {
             let id = e.file_name().to_string_lossy().into_owned();
-            if id == "opencode-mesh" || !e.path().is_dir() {
-                continue;
-            }
             let in_mesh = index
                 .keys()
                 .any(|k| k.starts_with(&format!("skills/{id}/")));
-            // Skills are uploaded one by one, only when asked: a per-skill answer or
+            // Skills are uploaded only when asked: "upload all", a per-skill answer or
             // --upload-skill. --prefer decides AGENTS.md only.
-            let choice = if self.o.upload_skills.contains(&id) {
+            let choice = if all || self.o.upload_skills.contains(&id) {
                 'u'
             } else if in_mesh {
                 let q =

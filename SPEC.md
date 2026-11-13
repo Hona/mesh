@@ -817,12 +817,14 @@ ssh-ed25519 AAAA… opencode-mesh:air
   after confirmation.
 - **Joining:** if local `AGENTS.md` differs from the mesh's, show the diff and ask:
   `[k]eep mesh` (back up local, replace) / `[u]pload this` (replaces it for every device;
-  pushed) / `[e]dit` (merge by hand, then keep or upload). Local skills not in the mesh:
-  upload / keep local / delete. Same-ID skills in both: `[k]eep mesh` (back up local) /
-  `[u]pload this`.
+  pushed) / `[e]dit` (merge by hand, then keep or upload). Local skills: first one question,
+  `[a]sk for each` / `[u]pload all` (every local skill, same-ID ones included, replacing the
+  mesh's). Asking for each: local skills not in the mesh: upload / keep local / delete.
+  Same-ID skills in both: `[k]eep mesh` (back up local) / `[u]pload this`.
 - `--yes` defaults to `--prefer mesh`, which (like `--prefer local`) decides only `AGENTS.md`.
-- Skills are never bulk-uploaded: each upload is its own answer, or `--upload-skill <id>`.
-  Non-interactive without it, local-only skills stay local and same-ID ones keep the mesh's.
+- Skills are uploaded only when asked: interactive "upload all", a per-skill answer, or
+  `--upload-skill <id>`. Non-interactive without it, local-only skills stay local and same-ID
+  ones keep the mesh's.
 - The first sync on a device names its `AGENTS.md` backup as the previous file, not as an
   edit "since the last sync".
 
